@@ -43,6 +43,15 @@ void RadioLibWrapper::begin() {
   _floor_sample_sum = 0;
 }
 
+void RadioLibWrapper::onExternalReinit() {
+  _radio->setPacketReceivedAction(setFlag);
+  state = STATE_IDLE;   // trigger a startReceive(), discarding any stale interrupt
+
+  _noise_floor = 0;
+  _num_floor_samples = 0;
+  _floor_sample_sum = 0;
+}
+
 uint32_t RadioLibWrapper::getRngSeed() {
   return _radio->random(0x7FFFFFFF);
 }
@@ -120,6 +129,10 @@ void RadioLibWrapper::startRecv() {
 
 bool RadioLibWrapper::isInRecvMode() const {
   return (state & ~STATE_INT_READY) == STATE_RX;
+}
+
+bool RadioLibWrapper::isIdleInRecvMode() {
+  return state == STATE_RX && !isReceivingPacket();
 }
 
 int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {

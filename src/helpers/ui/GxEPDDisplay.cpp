@@ -26,8 +26,12 @@ ColorVal UIColor::popup_txt = GxEPD_BLACK;
 ColorVal UIColor::corp_blue = GxEPD_BLACK;
 
 
+#ifndef EINK_SPI_HZ
+  #define EINK_SPI_HZ  4000000
+#endif
+
 bool GxEPDDisplay::begin() {
-  display.epd2.selectSPI(SPI1, SPISettings(4000000, MSBFIRST, SPI_MODE0));
+  display.epd2.selectSPI(SPI1, SPISettings(EINK_SPI_HZ, MSBFIRST, SPI_MODE0));
 #ifdef ESP32
   SPI1.begin(PIN_DISPLAY_SCLK, PIN_DISPLAY_MISO, PIN_DISPLAY_MOSI, PIN_DISPLAY_CS);
 #else
@@ -77,6 +81,7 @@ void GxEPDDisplay::startFrame(ColorVal bkg) {
   display.fillScreen(bkg);
   display.setTextColor(_curr_color = UIColor::primary_txt);
   display_crc.reset();
+  _native_drawn = false;
 }
 
 void GxEPDDisplay::setTextSize(int sz) {
@@ -129,6 +134,12 @@ void GxEPDDisplay::drawRect(int x, int y, int w, int h) {
   display.drawRect(x*scale_x, y*scale_y, w*scale_x, h*scale_y, _curr_color);
 }
 
+void GxEPDDisplay::fillRectNative(int x, int y, int w, int h) {
+  // native drawing is for live views that change every frame: skip the per-call CRC, it costs more than the drawing
+  _native_drawn = true;
+  display.fillRect(x, y, w, h, _curr_color);
+}
+
 void GxEPDDisplay::drawXbm(int x, int y, const uint8_t* bits, int w, int h) {
   display_crc.update<int>(x);
   display_crc.update<int>(y);
@@ -179,7 +190,7 @@ uint16_t GxEPDDisplay::getTextWidth(const char* str) {
 
 void GxEPDDisplay::endFrame() {
   uint32_t crc = display_crc.finalize();
-  if (crc != last_display_crc_value) {
+  if (crc != last_display_crc_value || _native_drawn) {
     display.display(true);
     last_display_crc_value = crc;
   }

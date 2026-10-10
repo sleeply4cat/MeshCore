@@ -1,0 +1,81 @@
+name: Build Spectrum Firmwares
+
+# Releases of this fork's spectrum branches: a tag v<upstream version>-spectrum-<variant>.<n> (eg.
+# v1.17.1-spectrum-meshpocket.1, v1.17.1-spectrum-faketec.1) on a commit of a branch builds the envs that branch lists in
+# .github/spectrum-envs, and drafts a release with them. A manual run only keeps the files as artifacts.
+#
+# Only people who can push tags or run workflows here (write access) start it: no pull_request triggers.
+# The build (repository code, PlatformIO packages) runs with a read-only token that isn't left in .git; only
+# the release job, which runs nothing from the repository, can write. Third-party actions are pinned by commit.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*-spectrum*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Clone Repo
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-environment
+
+      # the version ends up in compiler flags (build.sh): only plain characters get there
+      - name: Check Version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+(\.[0-9]+)*-spectrum(-[a-z0-9]+)*\.[0-9]+$ ]] || { echo "bad tag: $GITHUB_REF_NAME"; exit 1; }
+            version="$GITHUB_REF_NAME"
+          else
+            version=$(printf '%s' "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9._-' '-')
+          fi
+          echo "FIRMWARE_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build Firmwares
+        # one call for all of them: build.sh empties out/ every time it starts
+        run: |
+          /usr/bin/env bash build.sh build-firmware $(grep -v '^#' .github/spectrum-envs)
+          {
+            echo "SDR-like spectrum view (see the branch's commit), built from ${GITHUB_SHA::8}:"
+            grep -v '^#' .github/spectrum-envs | sed 's/^/- /'
+          } > out/release-notes.md
+
+      - name: Upload Workflow Artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: firmwares
+          path: out
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: firmwares
+          path: out
+
+      - name: Create Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          name: "Spectrum ${{ github.ref_name }}"
+          body_path: out/release-notes.md
+          draft: true
+          files: |
+            out/*.uf2
+            out/*.zip
