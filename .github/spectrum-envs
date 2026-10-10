@@ -1,2 +1,3 @@
 # PlatformIO envs built and released by .github/workflows/build-spectrum-firmwares.yml, one per line
-Mesh_pocket_companion_radio_ble
+ProMicro_companion_radio_ble
+ProMicro_companion_radio_usb

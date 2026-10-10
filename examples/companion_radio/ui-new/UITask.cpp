@@ -603,7 +603,7 @@ public:
 #if UI_SPECTRUM_PAGE == 1
 #include <helpers/radiolib/SX126xSpectrumScanner.h>
 
-#define SPECTRUM_POINTS      SX126xSpectrumScanner::MAX_POINTS
+#define SPECTRUM_POINTS      SX126xSpectrumScanner::MAX_POINTS   // at most; a sweep has as many points as the panel is wide
 #ifndef SPECTRUM_FRAME_MS
   #define SPECTRUM_FRAME_MS      50    // min time between drawing frames (the panel refresh overlaps it)
 #endif
@@ -612,6 +612,19 @@ public:
 #endif
 #define SPECTRUM_PEAK_DB     10      // the loudest point counts as a signal this far above the noise
 #define SPECTRUM_PEAK_FRAMES 3       // the peak marker follows the loudest point of the last this many frames
+#ifndef SPECTRUM_HEADER_H
+  #define SPECTRUM_HEADER_H      12    // header text line, in UI pixels (16 puts it in the yellow band of two-colour OLEDs)
+#endif
+#ifndef SPECTRUM_WF_ROW_MS
+  #define SPECTRUM_WF_ROW_MS     0     // a waterfall row per this many ms (the max over them), 0 = one per frame
+#endif
+#ifndef SPECTRUM_HOLD_DECAY_DBPS
+  #define SPECTRUM_HOLD_DECAY_DBPS 10  // peak-hold decay, dB per second
+#endif
+#ifndef SPECTRUM_AUTO_OFF_MILLIS
+  #define SPECTRUM_AUTO_OFF_MILLIS 300000   // with display auto-off: idle time after which the view hands the radio back
+#endif
+#define SPECTRUM_MIN_WF_ROWS 8       // below that, no waterfall: the graph gets the whole height
 #define SPECTRUM_NO_SIGNAL   -140
 #define SPECTRUM_RANGE_DB    50      // vertical range of the graph
 #define SPECTRUM_WF_LO       3       // waterfall: dB above noise where the grey scale starts
@@ -629,6 +642,7 @@ class SpectrumScreen : public UIScreen {
   bool _pending_start, _need_wipe;
   uint8_t _span_idx;
   float _freq, _bw;      // the mesh channel shown; follows the node's prefs (render())
+  uint32_t _last_input;  // for the idle timeout, on displays that turn off by themselves
 
   // shared with the scan task
   TaskHandle_t _scan_task;
@@ -641,9 +655,10 @@ class SpectrumScreen : public UIScreen {
 
   // display side
   int _w, _scale_y, _graph_y, _graph_h, _wf_y, _wf_rows, _wf_stride, _wf_head, _wf_count;
+  uint16_t _points;      // per sweep: one per pixel column, up to SPECTRUM_POINTS (set before the scan task starts)
   uint32_t _wf_pushed;
   uint8_t* _wf_mem;      // one allocation for all the buffers below
-  uint8_t* _wf;          // waterfall ring buffer of dithered 1-bit rows, one per frame
+  uint8_t* _wf;          // waterfall ring buffer of dithered 1-bit rows
   int16_t* _wf_err;      // error diffusion: carried into the next row, and being collected for it (2 x (w + 2))
   int16_t* _wf_err_next;
   uint8_t* _px_idx;      // per pixel column: left point index and weight of the right one, for interpolation
@@ -651,22 +666,22 @@ class SpectrumScreen : public UIScreen {
   int16_t _frame[SPECTRUM_POINTS], _hold[SPECTRUM_POINTS];
   int16_t _recent[SPECTRUM_PEAK_FRAMES - 1][SPECTRUM_POINTS];   // previous frames, for the peak marker
   uint8_t _recent_head;
+  int16_t _wf_acc[SPECTRUM_POINTS];   // max over the frames of the waterfall row being collected
   int16_t _floor_dbm, _frame_noise;
   uint32_t _header_at;
   int _peak;             // loudest point of the last few frames, -1 if it's not a signal: a marker on the scale
   int _hdr_peak;        // loudest signal point since the header was updated, -1 if none
   int16_t _hdr_peak_dbm;
   float _peak_mhz;       // frequency of the latest loudest signal, in the header
+  uint32_t _hold_at, _wf_row_at;
+  uint16_t _hold_frac;   // peak-hold decay not applied yet, in dB/1000
 
   // A point costs ~1 RSSI update, ~1.6/RBW ms (RBW in kHz), so the sweep time grows with points / RBW:
-  // ~56ms per sweep at 0.5MHz, ~21ms at 2MHz, ~5ms at 8MHz, ~4ms at 16MHz.
+  // with 250 points ~56ms per sweep at 0.5MHz, ~21ms at 2MHz, ~5ms at 8MHz, ~4ms at 16MHz. Fewer points
+  // (a narrower panel) mean wider steps, so a wider RBW too: faster on both counts.
   static float spanMHz(uint8_t idx) {
     static const float spans[] = { 0.5f, 2.0f, 8.0f, 16.0f };
     return spans[idx % 4];
-  }
-  static int spanPoints(uint8_t idx) {
-    static const uint8_t points[] = { 250, 250, 250, 250 };
-    return points[idx % 4];
   }
   static const uint16_t* spanTicksKHz(uint8_t idx) {   // frequency scale: ticks at round frequencies, 3 sizes
     static const uint16_t ticks[][3] = { { 25, 100, 500 }, { 100, 500, 1000 }, { 500, 1000, 5000 }, { 1000, 5000, 10000 } };
@@ -683,7 +698,7 @@ class SpectrumScreen : public UIScreen {
   static void scanTaskEntry(void* self) { ((SpectrumScreen *) self)->scanLoop(); }
 
   void applySpan(uint8_t idx) {
-    int n = spanPoints(idx);
+    int n = _points;
     float step = spanMHz(idx) / n;
     _scanner.setSweep(edgeMHz(idx) + step / 2, step, n, step * 1000.0f * spanRbwSteps(idx));
     for (int i = 0; i < SPECTRUM_POINTS; i++) _cur[i] = _fmax[i] = SPECTRUM_NO_SIGNAL;
@@ -738,12 +753,19 @@ class SpectrumScreen : public UIScreen {
 
   bool allocBuffers(DisplayDriver& d) {
     _w = d.nativeWidth();
+    _points = _w < SPECTRUM_POINTS ? _w : SPECTRUM_POINTS;
     int h = d.nativeHeight();
-    _scale_y = d.toNativeY(12) + 1;   // frequency scale: a line, ticks down from it
+    _scale_y = d.toNativeY(SPECTRUM_HEADER_H) + 1;   // frequency scale: a line, ticks down from it
     _graph_y = _scale_y + 4;
-    _graph_h = (h - _scale_y) * 2 / 5 - 4;
+    int avail = h - _scale_y;
+    _graph_h = avail * 2 / 5 - 4;
     _wf_y = _graph_y + _graph_h + 3;
     _wf_rows = h - _wf_y;
+    if (_wf_rows < SPECTRUM_MIN_WF_ROWS) {   // too short for a waterfall: all of it for the graph
+      _wf_rows = 0;
+      _graph_h = h - _graph_y - 3;           // room for the baseline and the channel marker
+      _wf_y = h;
+    }
 
     _wf_stride = (_w + 7) / 8;
 
@@ -761,7 +783,7 @@ class SpectrumScreen : public UIScreen {
   }
 
   void buildPixelMap() {
-    int n = spanPoints(_span_idx);
+    int n = _points;
     for (int x = 0; x < _w; x++) {   // point i is centred on pixel (i + 0.5) * w / points
       int pos = ((2 * x + 1) * n * 128) / _w - 128;   // in 1/256 of a point
       if (pos < 0) pos = 0;
@@ -778,7 +800,7 @@ class SpectrumScreen : public UIScreen {
   }
 
   void clearHistory() {
-    for (int i = 0; i < SPECTRUM_POINTS; i++) _frame[i] = _hold[i] = SPECTRUM_NO_SIGNAL;
+    for (int i = 0; i < SPECTRUM_POINTS; i++) _frame[i] = _hold[i] = _wf_acc[i] = SPECTRUM_NO_SIGNAL;
     for (int f = 0; f < SPECTRUM_PEAK_FRAMES - 1; f++)
       for (int i = 0; i < SPECTRUM_POINTS; i++) _recent[f][i] = SPECTRUM_NO_SIGNAL;
     _recent_head = 0;
@@ -786,11 +808,28 @@ class SpectrumScreen : public UIScreen {
     memset(_wf_err, 0, 2 * (_w + 2) * sizeof(int16_t));
     _wf_head = _wf_count = 0;
     _wf_pushed = 0;
+    _hold_frac = 0;
+    _hold_at = _wf_row_at = millis();
+  }
+
+  // median of a sweep's values (dBm), clamped to SPECTRUM_NO_SIGNAL..0
+  int medianDbm(const int16_t* v) const {
+    uint8_t counts[-SPECTRUM_NO_SIGNAL + 1];
+    memset(counts, 0, sizeof(counts));
+    for (int i = 0; i < _points; i++) {
+      int a = v[i] < SPECTRUM_NO_SIGNAL ? SPECTRUM_NO_SIGNAL : (v[i] > 0 ? 0 : v[i]);
+      counts[a - SPECTRUM_NO_SIGNAL]++;
+    }
+    for (int i = 0, seen = 0; i <= -SPECTRUM_NO_SIGNAL; i++) {
+      seen += counts[i];
+      if (seen * 2 >= _points) return i + SPECTRUM_NO_SIGNAL;
+    }
+    return 0;
   }
 
   // take the per-point max since the last frame, and push it into the waterfall
-  void takeFrame() {
-    int n = spanPoints(_span_idx);
+  void takeFrame(uint32_t now) {
+    int n = _points;
     vTaskSuspendAll();      // take and reset the accumulated sweeps as a whole (see scanLoop)
     for (int i = 0; i < n; i++) {
       int16_t v = _fmax[i];
@@ -798,37 +837,41 @@ class SpectrumScreen : public UIScreen {
       _frame[i] = v <= SPECTRUM_NO_SIGNAL ? _cur[i] : v;
     }
     xTaskResumeAll();
+
+    // peak-hold, decaying at a fixed rate whatever the frame rate (e-ink ~10, OLED ~20 FPS)
+    uint32_t dt = now - _hold_at;
+    _hold_at = now;
+    uint32_t decay = (dt > 1000 ? 1000 : dt) * SPECTRUM_HOLD_DECAY_DBPS + _hold_frac;   // dB/1000
+    int dec = decay / 1000;
+    _hold_frac = decay % 1000;
     for (int i = 0; i < n; i++) {
-      _hold[i] = _frame[i] > _hold[i] - 1 ? _frame[i] : _hold[i] - 1;   // peak-hold, decaying 1dB per frame
+      int h = _hold[i] - dec;
+      _hold[i] = _frame[i] > h ? _frame[i] : h;
+      if (_frame[i] > _wf_acc[i]) _wf_acc[i] = _frame[i];
     }
 
     // noise of this frame: median of its values. A frame is the max of the sweeps since the last one, so it
     // sits above a single sweep's median, and the waterfall scale must follow it. Every RSSI update is equally
     // noisy at any RBW (the update period is ~1.6/RBW), but wide spans get more sweeps per frame (~2 at 0.5MHz,
     // ~15 at 16MHz): the max lifts their noise more (+2 vs +6dB).
-    uint8_t counts[-SPECTRUM_NO_SIGNAL + 1];
-    memset(counts, 0, sizeof(counts));
-    for (int i = 0; i < n; i++) {
-      int v = _frame[i] < SPECTRUM_NO_SIGNAL ? SPECTRUM_NO_SIGNAL : (_frame[i] > 0 ? 0 : _frame[i]);
-      counts[v - SPECTRUM_NO_SIGNAL]++;
-    }
-    for (int i = 0, seen = 0; i <= -SPECTRUM_NO_SIGNAL; i++) {
-      seen += counts[i];
-      if (seen * 2 >= n) { _frame_noise = i + SPECTRUM_NO_SIGNAL; break; }
-    }
+    _frame_noise = medianDbm(_frame);
     int lo = _frame_noise - 6;   // graph baseline a little below the noise, in 5dB steps to keep it stable
     _floor_dbm = lo - ((lo % 5) + 5) % 5;
 
-    ditherRow(&_wf[_wf_head * _wf_stride]);
+    if (_wf_rows == 0 || now - _wf_row_at < SPECTRUM_WF_ROW_MS) return;
+    _wf_row_at = (now - _wf_row_at < 2 * SPECTRUM_WF_ROW_MS) ? _wf_row_at + SPECTRUM_WF_ROW_MS : now;   // keep the cadence
+    // the row is the max over its frames, so its noise sits higher still: the grey scale follows its own median
+    ditherRow(&_wf[_wf_head * _wf_stride], _wf_acc, medianDbm(_wf_acc));
+    for (int i = 0; i < n; i++) _wf_acc[i] = SPECTRUM_NO_SIGNAL;
     _wf_head = (_wf_head + 1) % _wf_rows;
     if (_wf_count < _wf_rows) _wf_count++;
     _wf_pushed++;
   }
 
-  // Floyd-Steinberg, row by row as frames come: the error flows to the right and into the next frame's row.
+  // Floyd-Steinberg, row by row as rows come: the error flows to the right and into the next row.
   // Each row is dithered once and then only scrolls, so old rows never change, and there's no fixed
-  // pattern for the scroll to invert (which flickers on e-ink).
-  void ditherRow(uint8_t* bits) {
+  // pattern for the scroll to invert (which flickers on e-ink, and crawls on an OLED).
+  void ditherRow(uint8_t* bits, const int16_t* row, int noise) {
     memset(bits, 0, _wf_stride);
     int16_t* carry = _wf_err + 1;        // [-1 .. w] valid
     int16_t* next = _wf_err_next + 1;
@@ -838,7 +881,7 @@ class SpectrumScreen : public UIScreen {
     int ahead = 0;
     for (int k = 0; k < _w; k++) {
       int x = reverse ? _w - 1 - k : k;
-      int db = interp(_frame, x) - _frame_noise - SPECTRUM_WF_LO;
+      int db = interp(row, x) - noise - SPECTRUM_WF_LO;
       int want = db <= 0 ? 0 : (db >= SPECTRUM_WF_RANGE ? 256 : db * 256 / SPECTRUM_WF_RANGE);
       int val = want + carry[x] + ahead;
       bool black = val >= 128;
@@ -884,7 +927,7 @@ class SpectrumScreen : public UIScreen {
       if (x >= 0 && x < _w) d.fillRectNative(x, _scale_y + 1, 1, k % ticks[2] == 0 ? 3 : (k % ticks[1] == 0 ? 2 : 1));
     }
     if (_peak >= 0) {   // the loudest signal: a small triangle over the ticks
-      int px = (2 * _peak + 1) * _w / (2 * spanPoints(_span_idx));
+      int px = (2 * _peak + 1) * _w / (2 * _points);
       for (int r = 0; r < 3; r++) d.fillRectNative(px - 2 + r, _scale_y + 1 + r, 5 - 2 * r, 1);
     }
     for (int db = 10; db < SPECTRUM_RANGE_DB; db += 10) {   // 10dB ticks
@@ -908,6 +951,29 @@ class SpectrumScreen : public UIScreen {
         if (!on && run >= 0) { d.fillRectNative(run, y, x - run, 1); run = -1; }
       }
     }
+  }
+
+  // edges of the span on the left, the loudest signal's frequency on the right; a narrow panel (128px OLED:
+  // 21 characters) gets the centre and the span instead of the edges
+  void renderHeader(DisplayDriver& d) {
+    char left[24], right[24];
+    float edge = edgeMHz(_span_idx), span = spanMHz(_span_idx);
+    int16_t err = _sweep_err;
+    bool ok = err == RADIOLIB_ERR_NONE;
+    sprintf(left, "%.3f-%.3f", edge, edge + span);
+    if (ok) sprintf(right, "%.3f", _peak_mhz);
+    else sprintf(right, "radio err %d", err);
+
+    const int gap = 6;
+    int wr = d.getTextWidth(right);
+    if (d.getTextWidth(left) + gap + wr > d.width()) {
+      sprintf(left, span < 1 ? "%.3f %.1fM" : "%.3f %.0fM", _freq, span);
+    }
+    if (d.getTextWidth(left) + gap + wr <= d.width()) {   // else only the error: it matters more
+      d.setCursor(0, 0);
+      d.print(left);
+    }
+    d.drawTextRightAlign(d.width() - 1, 0, right);
   }
 
   void restoreRadio() {
@@ -947,6 +1013,7 @@ public:
     }
     _freq = _prefs->freq;
     _bw = _prefs->bw;
+    _last_input = millis();
     _sweep_err = RADIOLIB_ERR_NONE;
     _frame_noise = -115;
     _floor_dbm = -125;
@@ -972,6 +1039,15 @@ public:
   }
 
   void poll() override {
+  #if AUTO_OFF_MILLIS > 0
+    // where the display turns itself off (OLEDs), the view would hold the mesh off for good if forgotten:
+    // it keeps the display on, and hands the radio back after a while without input
+    if (_scanner.isActive() && millis() - _last_input > SPECTRUM_AUTO_OFF_MILLIS) {
+      _task->showAlert("Mesh radio resumed", 1500);
+      _task->gotoHomeScreen();   // stops the scan, see UITask::setCurrScreen()
+      return;
+    }
+  #endif
     if (!_pending_start || !radio_driver.isIdleInRecvMode()) return;   // not mid-TX, mid-RX or with a packet to read
     _pending_start = false;
   #ifdef SX126X_DIO3_TCXO_VOLTAGE
@@ -1000,7 +1076,6 @@ public:
 
   int render(DisplayDriver& d) override {
     uint32_t t0 = millis();
-    char tmp[40];
     d.setTextSize(1);
     d.setColor(UIColor::title_txt);
     if (!_scanner.isActive()) {
@@ -1017,8 +1092,8 @@ public:
       d.wipe();
       _need_wipe = false;
     }
-    takeFrame();
-    int n = spanPoints(_span_idx);
+    takeFrame(t0);
+    int n = _points;
     // the loudest point of the last few frames (not of the peak-hold, which lingers for seconds), if it
     // stands out
     _peak = -1;
@@ -1044,15 +1119,7 @@ public:
       if (_hdr_peak >= 0) _peak_mhz = edgeMHz(_span_idx) + spanMHz(_span_idx) * (_hdr_peak + 0.5f) / n;
       _hdr_peak = -1;
     }
-
-    float edge = edgeMHz(_span_idx);
-    sprintf(tmp, "%.3f-%.3f", edge, edge + spanMHz(_span_idx));
-    d.setCursor(0, 0);
-    d.print(tmp);
-    int16_t err = _sweep_err;
-    if (err != RADIOLIB_ERR_NONE) sprintf(tmp, "radio err %d", err);
-    else sprintf(tmp, "%.3f", _peak_mhz);
-    d.drawTextRightAlign(d.width() - 1, 0, tmp);
+    renderHeader(d);
 
     d.setColor(UIColor::primary_txt);
     renderGraph(d);
@@ -1063,6 +1130,7 @@ public:
   }
 
   bool handleInput(char c) override {
+    _last_input = millis();
     if (c == KEY_NEXT || c == KEY_RIGHT) {   // zoom out
       changeSpan(_span_idx + 1);
       return true;
@@ -1387,6 +1455,9 @@ void UITask::loop() {
       _auto_off = millis() + AUTO_OFF_MILLIS;
     }
 #endif
+    if (isRadioBorrowed()) {
+      _auto_off = millis() + AUTO_OFF_MILLIS;   // a live view: the spectrum screen times out on its own
+    }
     if (millis() > _auto_off) {
       _display->turnOff();
     }

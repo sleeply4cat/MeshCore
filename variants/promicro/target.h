@@ -7,13 +7,18 @@
 #include <helpers/radiolib/CustomSX1262Wrapper.h>
 #include <helpers/AutoDiscoverRTCClock.h>
 #ifdef DISPLAY_CLASS
-  #include <helpers/ui/SSD1306Display.h>
+  #ifdef DISPLAY_AUTO_OLED
+    #include <helpers/ui/AutoOLEDDisplay.h>   // SSD1306 / SSD1315 / SH1106, told apart at run time
+  #else
+    #include <helpers/ui/SSD1306Display.h>
+  #endif
   #include <helpers/ui/MomentaryButton.h>
 #endif
 
 #include <helpers/sensors/EnvironmentSensorManager.h>
 
 extern PromicroBoard board;
+extern RADIO_CLASS radio;
 extern WRAPPER_CLASS radio_driver;
 extern AutoDiscoverRTCClock rtc_clock;
 extern EnvironmentSensorManager sensors;
