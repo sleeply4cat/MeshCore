@@ -51,6 +51,7 @@ class UITask : public AbstractUITask {
   UIScreen* splash;
   UIScreen* home;
   UIScreen* msg_preview;
+  UIScreen* spectrum;
   UIScreen* curr;
 
   void userLedHandler();
@@ -68,11 +69,14 @@ public:
   UITask(mesh::MainBoard* board, MultiSerialInterface* serial) : AbstractUITask(board, serial), _display(NULL), _sensors(NULL) {
     next_batt_chck = _next_refresh = 0;
     ui_started_at = 0;
-    curr = NULL;
+    curr = spectrum = NULL;
   }
   void begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* node_prefs);
 
   void gotoHomeScreen() { setCurrScreen(home); }
+  void gotoSpectrumScreen();
+  void releaseRadio();
+  void triggerRefresh() { _next_refresh = 0; }
   void showAlert(const char* text, int duration_millis);
   int  getMsgCount() const { return _msgcount; }
   bool hasDisplay() const { return _display != NULL; }
@@ -96,6 +100,7 @@ public:
   void newMsg(uint8_t path_len, const char* from_name, const char* text, int msgcount) override;
   void notify(UIEventType t = UIEventType::none) override;
   void loop() override;
+  bool isRadioBorrowed() const override;
 
   void shutdown(bool restart = false);
 };

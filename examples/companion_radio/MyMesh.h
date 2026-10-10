@@ -207,6 +207,7 @@ private:
   // helpers, short-cuts
   void saveChannels() { _store->saveChannels(this); }
   void saveContacts();
+  bool isRadioBorrowed() const { return _ui != NULL && _ui->isRadioBorrowed(); }
 
   DataStore* _store;
   NodePrefs _prefs;

@@ -256,6 +256,11 @@ void loop() {
   external_watchdog.loop();
 #endif
 
+#if defined(NRF52_PLATFORM) && defined(DISPLAY_CLASS)
+  if (ui_task.isRadioBorrowed()) {
+    delay(1);   // the mesh is paused while the UI owns the radio: block this task, so the UI's scan task gets the CPU
+  } else
+#endif
   if (!the_mesh.hasPendingWork()) {
 #if defined(NRF52_PLATFORM)
     board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
