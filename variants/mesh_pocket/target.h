@@ -15,6 +15,7 @@
 #endif
 
 extern HeltecMeshPocket board;
+extern RADIO_CLASS radio;
 extern WRAPPER_CLASS radio_driver;
 extern AutoDiscoverRTCClock rtc_clock;
 
