@@ -27,9 +27,15 @@ static SerialBLEInterface* instance = nullptr;
 void SerialBLEInterface::onConnect(uint16_t connection_handle) {
   BLE_DEBUG_PRINTLN("SerialBLEInterface: connected handle=0x%04X", connection_handle);
   if (instance) {
-    instance->_conn_handle = connection_handle;
-    instance->_isDeviceConnected = false;
-    instance->clearBuffers();
+    if (instance->hasAppConnection()) {
+      // another client next to the app (BLE_MAX_CONNECTIONS > 1): it takes over the UART only once it uses it
+      BLE_DEBUG_PRINTLN("SerialBLEInterface: extra connection handle=0x%04X", connection_handle);
+    } else {
+      instance->_conn_handle = connection_handle;
+      instance->_isDeviceConnected = false;
+      instance->clearBuffers();
+    }
+    instance->restartAdvertising();   // stay connectable while there are free connections
   }
 }
 
@@ -41,6 +47,8 @@ void SerialBLEInterface::onDisconnect(uint16_t connection_handle, uint8_t reason
       instance->_isDeviceConnected = false;
       instance->clearBuffers();
     }
+    // Bluefruit only restarts it once no connection is left
+    instance->restartAdvertising();
   }
 }
 
@@ -49,29 +57,68 @@ void SerialBLEInterface::onSecured(uint16_t connection_handle) {
   if (instance) {
     if (instance->isValidConnection(connection_handle, true)) {
       instance->_isDeviceConnected = true;
-      
-      // Connection interval units: 1.25ms, supervision timeout units: 10ms
-      // Apple: "The product will not read or use the parameters in the Peripheral Preferred Connection Parameters characteristic."
-      // So we explicitly set it here to make Android & Apple match
-      ble_gap_conn_params_t conn_params;
-      conn_params.min_conn_interval = BLE_MIN_CONN_INTERVAL;
-      conn_params.max_conn_interval = BLE_MAX_CONN_INTERVAL;
-      conn_params.slave_latency = BLE_SLAVE_LATENCY;
-      conn_params.conn_sup_timeout = BLE_CONN_SUP_TIMEOUT;
-      
-      uint32_t err_code = sd_ble_gap_conn_param_update(connection_handle, &conn_params);
-      if (err_code == NRF_SUCCESS) {
-        BLE_DEBUG_PRINTLN("Connection parameter update requested: %u-%ums interval, latency=%u, %ums timeout",
-                         conn_params.min_conn_interval * 5 / 4,  // convert to ms (1.25ms units)
-                         conn_params.max_conn_interval * 5 / 4,
-                         conn_params.slave_latency,
-                         conn_params.conn_sup_timeout * 10);  // convert to ms (10ms units)
-      } else {
-        BLE_DEBUG_PRINTLN("Failed to request connection parameter update: %lu", err_code);
-      }
+      requestConnParams(connection_handle);
+    } else if (connection_handle != instance->_conn_handle && instance->bleuart.notifyEnabled(connection_handle)) {
+      // an extra connection whose (bonded) peer had the UART's notifications on: the app reconnecting
+      instance->adoptConnection(connection_handle);
     } else {
       BLE_DEBUG_PRINTLN("onSecured: ignoring stale/duplicate callback");
     }
+  }
+}
+
+void SerialBLEInterface::requestConnParams(uint16_t connection_handle) {
+  // Connection interval units: 1.25ms, supervision timeout units: 10ms
+  // Apple: "The product will not read or use the parameters in the Peripheral Preferred Connection Parameters characteristic."
+  // So we explicitly set it here to make Android & Apple match
+  ble_gap_conn_params_t conn_params;
+  conn_params.min_conn_interval = BLE_MIN_CONN_INTERVAL;
+  conn_params.max_conn_interval = BLE_MAX_CONN_INTERVAL;
+  conn_params.slave_latency = BLE_SLAVE_LATENCY;
+  conn_params.conn_sup_timeout = BLE_CONN_SUP_TIMEOUT;
+
+  uint32_t err_code = sd_ble_gap_conn_param_update(connection_handle, &conn_params);
+  if (err_code == NRF_SUCCESS) {
+    BLE_DEBUG_PRINTLN("Connection parameter update requested: %u-%ums interval, latency=%u, %ums timeout",
+                     conn_params.min_conn_interval * 5 / 4,  // convert to ms (1.25ms units)
+                     conn_params.max_conn_interval * 5 / 4,
+                     conn_params.slave_latency,
+                     conn_params.conn_sup_timeout * 10);  // convert to ms (10ms units)
+  } else {
+    BLE_DEBUG_PRINTLN("Failed to request connection parameter update: %lu", err_code);
+  }
+}
+
+// With several connections, the app's is the one using the UART service: the first one, until another one
+// turns on the UART's notifications or writes to it (eg. the app reconnecting while the spectrum page is connected)
+bool SerialBLEInterface::hasAppConnection() const {
+  if (_conn_handle == BLE_CONN_HANDLE_INVALID) return false;
+  BLEConnection* conn = Bluefruit.Connection(_conn_handle);
+  return conn != nullptr && conn->connected();
+}
+
+void SerialBLEInterface::adoptConnection(uint16_t handle) {
+  BLE_DEBUG_PRINTLN("SerialBLEInterface: UART now on handle=0x%04X", handle);
+  BLEConnection* conn = Bluefruit.Connection(handle);
+  bool secured = conn != nullptr && conn->connected() && conn->secured();
+  _conn_handle = handle;
+  _isDeviceConnected = secured;
+  send_queue_len = 0;   // not clearBuffers(): the UART's RX FIFO may hold this connection's first frame
+  recv_queue_len = 0;
+  _last_retry_attempt = 0;
+  if (secured) requestConnParams(handle);
+}
+
+void SerialBLEInterface::restartAdvertising() {
+  if (BLE_MAX_CONNECTIONS > 1 && _isEnabled && !Bluefruit.Advertising.isRunning()
+      && Bluefruit.Periph.connected() < BLE_MAX_CONNECTIONS) {
+    Bluefruit.Advertising.start(0);
+  }
+}
+
+void SerialBLEInterface::onBleUartNotify(uint16_t connection_handle, bool enabled) {
+  if (instance && enabled && connection_handle != instance->_conn_handle) {
+    instance->adoptConnection(connection_handle);
   }
 }
 
@@ -131,8 +178,8 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
   
   // If we want to control BLE LED ourselves, uncomment this:
   // Bluefruit.autoConnLed(false);
-  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
-  Bluefruit.begin();
+  Bluefruit.configPrphConn(247, 100, BLE_HVN_QUEUE_SIZE, BLE_GATTC_WRITE_CMD_TX_QUEUE_SIZE_DEFAULT);   // BANDWIDTH_MAX, but the queue
+  Bluefruit.begin(BLE_MAX_CONNECTIONS, 0);
  
   char dev_name[32+16];
   if (strcmp(name, "@@MAC") == 0) {
@@ -180,6 +227,7 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
   bleuart.setPermission(SECMODE_ENC_WITH_MITM, SECMODE_ENC_WITH_MITM);
   bleuart.begin();
   bleuart.setRxCallback(onBleUartRX);
+  bleuart.setNotifyCallback(onBleUartNotify);
 
 
 
@@ -307,7 +355,7 @@ size_t SerialBLEInterface::checkRecvFrame(uint8_t dest[]) {
       if (!throttle_active) {
         Frame frame_to_send = send_queue[0];
 
-        size_t written = bleuart.write(frame_to_send.buf, frame_to_send.len);
+        size_t written = bleuart.write(_conn_handle, frame_to_send.buf, frame_to_send.len);
         if (written == frame_to_send.len) {
           BLE_DEBUG_PRINTLN("writeBytes: sz=%u, hdr=%u", (unsigned)frame_to_send.len, (unsigned)frame_to_send.buf[0]);
           _last_retry_attempt = 0;
@@ -362,6 +410,10 @@ void SerialBLEInterface::onBleUartRX(uint16_t conn_handle) {
     return;
   }
   
+  if (instance->_conn_handle != conn_handle) {   // another connection writing to the UART: the app, reconnected
+    BLEConnection* conn = Bluefruit.Connection(conn_handle);
+    if (conn != nullptr && conn->connected() && conn->secured()) instance->adoptConnection(conn_handle);
+  }
   if (instance->_conn_handle != conn_handle || !instance->isConnected()) {
     while (instance->bleuart.available() > 0) {
       instance->bleuart.read();
@@ -398,7 +450,12 @@ void SerialBLEInterface::onBleUartRX(uint16_t conn_handle) {
 }
 
 bool SerialBLEInterface::isConnected() const {
+#if BLE_MAX_CONNECTIONS > 1
+  // only a client with the UART's notifications on is the app (not, eg., the spectrum page connected first)
+  return _isDeviceConnected && Bluefruit.connected() > 0 && const_cast<BLEUart&>(bleuart).notifyEnabled(_conn_handle);
+#else
   return _isDeviceConnected && Bluefruit.connected() > 0;
+#endif
 }
 
 bool SerialBLEInterface::isWriteBusy() const {

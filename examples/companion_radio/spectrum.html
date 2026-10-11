@@ -1,0 +1,795 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MeshCore Spectrum</title>
+<!--
+  Live view of a MeshCore companion's spectrum mode (Mesh Pocket, firmware with SPECTRUM_BLE) over Web Bluetooth:
+  spectrum + waterfall, and the device's span / centre settings. Works next to the MeshCore app's connection.
+  Needs a browser with Web Bluetooth (Chrome / Edge on desktop or Android) and a secure origin: open it from
+  https:// or http://localhost (eg. `python3 -m http.server` in this folder), or as a local file. Chrome on Linux
+  only has it with chrome://flags/#enable-experimental-web-platform-features turned on.
+  The device asks for the same PIN as the app on the first connection; if the browser can't show that prompt
+  (some Linux setups), pair the device in the system's Bluetooth settings first (or: bluetoothctl, pair <MAC>).
+  The node sends a frame per interval (Stream), each the max / mean power / latest of the sweeps since the previous
+  one; frames the link can't carry are dropped. ~50 frames/s get through with Linux (BlueZ) defaults.
+  Protocol: src/helpers/nrf52/SpectrumBLEService.h
+-->
+<style>
+  :root {
+    --bg: #f4f5f7; --panel: #ffffff; --text: #1d2330; --muted: #69707d; --line: #d9dce2;
+    --accent: #1f6feb; --accent-text: #ffffff; --plot: #ffffff; --grid: rgba(0, 0, 0, 0.09);
+    --label: #5b6270; --trace: #0b62d6; --fill: rgba(11, 98, 214, 0.16); --hold: rgba(214, 72, 11, 0.75);
+    --channel: rgba(30, 160, 80, 0.14); --channel-line: rgba(30, 140, 70, 0.8); --cursor: rgba(0, 0, 0, 0.45);
+    --warn: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0e1116; --panel: #161b22; --text: #e6e8eb; --muted: #8b93a1; --line: #2a313c;
+      --accent: #2f81f7; --accent-text: #ffffff; --plot: #0b0e13; --grid: rgba(255, 255, 255, 0.08);
+      --label: #8b93a1; --trace: #58a6ff; --fill: rgba(88, 166, 255, 0.18); --hold: rgba(255, 166, 87, 0.8);
+      --channel: rgba(63, 185, 80, 0.13); --channel-line: rgba(63, 185, 80, 0.8); --cursor: rgba(255, 255, 255, 0.5);
+      --warn: #f85149;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0e1116; --panel: #161b22; --text: #e6e8eb; --muted: #8b93a1; --line: #2a313c;
+    --accent: #2f81f7; --accent-text: #ffffff; --plot: #0b0e13; --grid: rgba(255, 255, 255, 0.08);
+    --label: #8b93a1; --trace: #58a6ff; --fill: rgba(88, 166, 255, 0.18); --hold: rgba(255, 166, 87, 0.8);
+    --channel: rgba(63, 185, 80, 0.13); --channel-line: rgba(63, 185, 80, 0.8); --cursor: rgba(255, 255, 255, 0.5);
+    --warn: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; height: 100vh; height: 100dvh; overflow: hidden;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  .bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px 4px; background: var(--panel); }
+  .bar h1 { font-size: 16px; margin: 0 4px 0 0; font-weight: 600; white-space: nowrap; }
+  .unit { color: var(--muted); font-size: 12px; align-self: center; padding-left: 6px; }
+  #more { margin-left: auto; font-size: 18px; line-height: 1; padding: 4px 10px; }
+  #more[aria-expanded="true"] { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  #status {
+    padding: 0 12px 6px; font-size: 12px; color: var(--muted); background: var(--panel); border-bottom: 1px solid var(--line);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #status.err { color: var(--warn); white-space: normal; }   /* an error is read in full */
+  .controls {
+    display: none; flex-wrap: wrap; gap: 8px 20px; align-items: center; padding: 8px 12px;
+    background: var(--panel); border-bottom: 1px solid var(--line); max-height: 45vh; max-height: 45dvh; overflow-y: auto;
+  }
+  .controls.open { display: flex; }
+  .group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .group > .lbl { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; min-width: 4.5em; }
+  button, select, input {
+    font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 10px; min-height: 32px;
+  }
+  button { cursor: pointer; white-space: nowrap; }
+  button:disabled, select:disabled, input:disabled { opacity: 0.45; cursor: default; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  .seg { display: inline-flex; }
+  .seg button { border-radius: 0; margin-left: -1px; min-width: 42px; }
+  .seg button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
+  .seg button:last-of-type { border-radius: 0 6px 6px 0; }
+  .seg button.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); position: relative; }
+  input[type=number] { width: 7.5em; }
+  main { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 6px 12px; gap: 6px; }
+  .plot { position: relative; background: var(--plot); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  #specBox { flex: 4; min-height: 100px; }
+  #wfBox { flex: 5; min-height: 60px; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #overlay {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 15px; pointer-events: none; text-align: center; padding: 16px;
+  }
+  /* readings: a grid whose columns follow the width alone, so changing values never change its height */
+  footer {
+    color: var(--muted); font-size: 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(165px, 1fr));
+    gap: 2px 14px; padding: 6px 12px; border-top: 1px solid var(--line); background: var(--panel);
+    font-variant-numeric: tabular-nums;
+  }
+  footer span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  footer b { color: var(--text); font-weight: 500; }
+  /* wide screens: all the settings in view */
+  @media (min-width: 1000px) {
+    .controls { display: flex; }
+    #more { display: none; }
+  }
+  /* phones */
+  @media (max-width: 600px) {
+    .bar { flex-wrap: wrap; }
+    .bar h1 { display: none; }
+    #spans { order: 10; flex: 1; }
+    #spans button { flex: 1; }
+    main { padding: 4px 8px; gap: 4px; }
+    .bar, #status, .controls, footer { padding-left: 8px; padding-right: 8px; }
+    footer { grid-template-columns: 1fr 1fr; gap: 0 12px; line-height: 1.3; padding-top: 4px; padding-bottom: 4px; }
+  }
+  /* short screens (phones held sideways): more room for the spectrum, the status in one scrolling line */
+  @media (max-height: 520px) {
+    #specBox { flex: 5; }
+    #wfBox { flex: 3; }
+    footer { display: flex; gap: 14px; overflow-x: auto; padding-top: 3px; padding-bottom: 3px; }
+    footer span { overflow: visible; flex: none; }
+    .bar { padding-top: 4px; }
+  }
+  /* touch: bigger targets, and 16px text so that phones don't zoom into a focused field */
+  @media (pointer: coarse) {
+    button, select, input { min-height: 40px; font-size: 16px; }
+  }
+</style>
+</head>
+<body>
+<header class="bar">
+  <h1>MeshCore Spectrum</h1>
+  <button id="connect" class="primary">Connect</button>
+  <button id="run" disabled>Start</button>
+  <div class="seg" id="spans" role="group" aria-label="Span">
+    <button data-span="0" disabled>0.5</button><button data-span="1" disabled>2</button><button data-span="2" disabled>8</button><button data-span="3" disabled>16</button><span class="unit">MHz</span>
+  </div>
+  <button id="more" aria-expanded="false" aria-controls="settings" title="Settings">&#9881;&#xFE0E;</button>
+</header>
+<div id="status">Not connected</div>
+
+<div class="controls" id="settings">
+  <div class="group">
+    <span class="lbl">Centre</span>
+    <button id="left" title="Move left by a quarter of the span" disabled>&#9664;</button>
+    <input id="centre" type="number" inputmode="decimal" step="0.001" min="150" max="960" disabled aria-label="Centre frequency, MHz">
+    <button id="right" title="Move right by a quarter of the span" disabled>&#9654;</button>
+    <button id="follow" title="Centre on the node's channel, and follow it" disabled>Node channel</button>
+  </div>
+  <div class="group">
+    <span class="lbl">Stream</span>
+    <select id="interval" title="Frames sent by the node; more than the link carries are dropped" disabled>
+      <option value="200">5 frames/s</option><option value="100">10 frames/s</option><option value="50">20 frames/s</option><option value="20">50 frames/s</option><option value="0">Every sweep</option>
+    </select>
+    <select id="agg" title="What a frame holds, of the sweeps since the previous one" disabled>
+      <option value="0">Max (catches bursts)</option><option value="1">Mean power</option><option value="2">Latest sweep</option>
+    </select>
+  </div>
+  <div class="group">
+    <span class="lbl">Display</span>
+    <select id="avg" title="Averaging of the trace">
+      <option value="1">No averaging</option><option value="3">Avg 3</option><option value="8">Avg 8</option><option value="20">Avg 20</option>
+    </select>
+    <select id="hold" title="Peak hold">
+      <option value="off">No hold</option><option value="decay" selected>Hold, decaying</option><option value="max">Max hold</option>
+    </select>
+    <select id="range" title="Vertical range">
+      <option value="40">40 dB</option><option value="60" selected>60 dB</option><option value="80">80 dB</option>
+    </select>
+    <button id="clear" title="Clear hold, waterfall and cursor">Clear</button>
+  </div>
+</div>
+
+<main>
+  <div class="plot" id="specBox"><canvas id="spec"></canvas><div id="overlay">Connect to a node to see its spectrum</div></div>
+  <div class="plot" id="wfBox"><canvas id="wf"></canvas></div>
+</main>
+
+<footer>
+  <span title="Peak: the loudest point, marked on the plot">&#9660;&#xFE0E; <b id="fPeak">–</b></span>
+  <span>Noise <b id="fNoise">–</b></span>
+  <span>Frames <b id="fFps">–</b></span>
+  <span>RBW <b id="fRbw">–</b></span>
+  <span>Step <b id="fStep">–</b></span>
+  <span>Node <b id="fNode">–</b></span>
+</footer>
+
+<script>
+'use strict';
+const NUS_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const SVC_UUID = 'e5a1f000-7c2e-4d6b-9b8a-3f1c2d4e5a60';
+const INFO_UUID = 'e5a1f001-7c2e-4d6b-9b8a-3f1c2d4e5a60';
+const DATA_UUID = 'e5a1f002-7c2e-4d6b-9b8a-3f1c2d4e5a60';
+const CTRL_UUID = 'e5a1f003-7c2e-4d6b-9b8a-3f1c2d4e5a60';
+const CTRL = { START: 1, STOP: 2, SPAN: 3, CENTRE: 4, INTERVAL: 5, AGG: 6 };
+const STATE = { OFF: 0, STARTING: 1, RUNNING: 2 };
+const SPANS_MHZ = [0.5, 2, 8, 16];
+const NO_DATA = 255;
+
+const $ = (id) => document.getElementById(id);
+const ui = {
+  connect: $('connect'), status: $('status'), run: $('run'), spans: [...document.querySelectorAll('#spans button')],
+  left: $('left'), right: $('right'), centre: $('centre'), follow: $('follow'), interval: $('interval'), agg: $('agg'),
+  avg: $('avg'), hold: $('hold'), range: $('range'), clear: $('clear'), overlay: $('overlay'),
+  more: $('more'), settings: $('settings'),
+  spec: $('spec'), wf: $('wf'),
+};
+
+let device = null, ctrlChr = null, info = null, userDisconnect = false;
+let writeChain = Promise.resolve();
+
+// ---------------- BLE ----------------
+
+function setStatus(text, err = false) {
+  ui.status.textContent = text;
+  ui.status.classList.toggle('err', err);
+}
+
+function parseInfo(dv) {
+  return {
+    version: dv.getUint8(0), state: dv.getUint8(1), span: dv.getUint8(2), n: dv.getUint8(3),
+    startHz: dv.getUint32(4, true), stepHz: dv.getUint32(8, true), rbwHz: dv.getUint32(12, true),
+    centreHz: dv.getUint32(16, true), nodeHz: dv.getUint32(20, true), nodeBwHz: dv.getUint32(24, true),
+    err: dv.getInt16(28, true), gen: dv.getUint8(30), follow: (dv.getUint8(31) & 1) !== 0,
+    intervalMs: dv.byteLength >= 36 ? dv.getUint16(32, true) : null, agg: dv.byteLength >= 36 ? dv.getUint8(34) : null,
+  };
+}
+
+function send(op, arg) {   // queued: Web Bluetooth allows one GATT operation at a time
+  if (!ctrlChr) return;
+  const bytes = arg === undefined ? [op] : [op, arg & 255, (arg >>> 8) & 255, (arg >>> 16) & 255, (arg >>> 24) & 255];
+  const len = arg === undefined ? 1 : { [CTRL.START]: 2, [CTRL.SPAN]: 2, [CTRL.AGG]: 2, [CTRL.INTERVAL]: 3 }[op] || 5;
+  const data = new Uint8Array(bytes.slice(0, len));
+  writeChain = writeChain.then(() => ctrlChr.writeValueWithResponse(data)).catch((e) => setStatus('Write failed: ' + e.message, true));
+}
+
+function noBluetoothReason() {
+  const ua = navigator.userAgent;
+  if (!window.isSecureContext) {
+    return 'Web Bluetooth needs a secure page: open it from https://, http://localhost or as a file (this is ' + location.origin + ')';
+  }
+  if (navigator.brave) return 'Web Bluetooth is off in Brave: turn on brave://flags/#brave-web-bluetooth-api and restart it';
+  if (/Firefox\//.test(ua)) return 'Firefox has no Web Bluetooth: use Chrome, Chromium or Edge';
+  if (/iPhone|iPad|Macintosh/.test(ua) && !/Chrome\//.test(ua)) return 'Safari has no Web Bluetooth: use Chrome or Edge (on iOS: the Bluefy browser)';
+  if (/Linux/.test(ua) && !/Android/.test(ua)) {
+    return 'Chrome on Linux keeps Web Bluetooth behind a flag: turn on chrome://flags/#enable-experimental-web-platform-features, restart the browser and reload';
+  }
+  return 'Web Bluetooth isn\'t available in this browser (or is turned off by a policy or flag)';
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    setStatus(noBluetoothReason(), true);
+    return;
+  }
+  let picked;
+  try {
+    picked = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [NUS_UUID] }, { namePrefix: 'MeshCore' }],
+      optionalServices: [SVC_UUID],
+    });
+  } catch (e) {
+    if (e.name !== 'NotFoundError') setStatus(e.message, true);   // NotFoundError: the chooser was cancelled
+    return;
+  }
+  if (device && device !== picked) device.removeEventListener('gattserverdisconnected', onDisconnected);
+  device = picked;
+  device.addEventListener('gattserverdisconnected', onDisconnected);
+  userDisconnect = false;
+  await openGatt();
+}
+
+// A connection that was up and dropped is retried for a while; one that fails while being set up only a few
+// times, and not at all when retrying can't help. Its error stays on screen, with what to do about it.
+const SETUP_RETRIES = 3, LOST_RETRIES = 20;
+let wasUp = false, attempts = 0, setupError = null, giveUp = false;
+
+function explain(e, step) {
+  const what = (e && (e.name ? e.name + ': ' : '') + (e.message || e)) || 'unknown error';
+  if (step === 'service') {
+    giveUp = true;
+    return 'No spectrum service on this node (' + what + '). If its firmware has one, this phone or PC remembers ' +
+      'the node\'s services from older firmware: forget the node in the system\'s Bluetooth settings, pair it again ' +
+      '(PIN from its screen), then reconnect.';
+  }
+  if (step === 'read' && /auth|secur|pair|encrypt|insufficient|not permitted|GATT operation failed/i.test(what)) {
+    return 'Pairing failed (' + what + '): check the PIN on the node\'s screen. If the node was paired before, ' +
+      'forget it in the system\'s Bluetooth settings and pair again.';
+  }
+  return 'Connection failed at ' + step + ' (' + what + ')';
+}
+
+async function openGatt() {
+  let step = 'connect';
+  try {
+    setStatus('Connecting to ' + (device.name || 'device') + '…' + (attempts ? ' (attempt ' + (attempts + 1) + ')' : ''));
+    const server = await device.gatt.connect();
+    step = 'service';
+    const svc = await server.getPrimaryService(SVC_UUID);
+    step = 'characteristics';
+    const infoChr = await svc.getCharacteristic(INFO_UUID);
+    const dataChr = await svc.getCharacteristic(DATA_UUID);
+    const ctrl = await svc.getCharacteristic(CTRL_UUID);
+    step = 'read';
+    setStatus('Pairing / reading…');
+    onInfo(parseInfo(await infoChr.readValue()));   // encrypted: the first read brings up the pairing (PIN)
+    step = 'notifications';
+    infoChr.addEventListener('characteristicvaluechanged', (ev) => onInfo(parseInfo(ev.target.value)));
+    await infoChr.startNotifications();
+    dataChr.addEventListener('characteristicvaluechanged', (ev) => onPacket(ev.target.value));
+    await dataChr.startNotifications();
+    ctrlChr = ctrl;
+    wasUp = true;
+    attempts = 0;
+    setupError = null;
+    setStatus('Connected to ' + (device.name || 'device'));
+    ui.connect.textContent = 'Disconnect';
+    ui.connect.classList.remove('primary');
+    setControls(true);
+  } catch (e) {
+    console.warn('spectrum: ' + step + ' failed', e);
+    setupError = explain(e, step);
+    setStatus(setupError, true);
+    if (device.gatt.connected) {
+      try { device.gatt.disconnect(); } catch (_) { /* already gone */ }   // onDisconnected() decides what's next
+    } else {
+      onDisconnected();
+    }
+  }
+}
+
+function onDisconnected() {
+  ctrlChr = null;
+  setControls(false);
+  ui.connect.textContent = 'Connect';
+  ui.connect.classList.add('primary');
+  if (userDisconnect || !device) {
+    setStatus('Not connected');
+    return;
+  }
+  attempts++;
+  const limit = wasUp ? LOST_RETRIES : SETUP_RETRIES;
+  if (giveUp || attempts > limit) {
+    setStatus((setupError || 'Connection lost') + ' — press Connect to try again', true);
+    return;
+  }
+  setStatus((setupError ? setupError + ' — retrying' : 'Connection lost, reconnecting') + ' (' + attempts + '/' + limit + ')…', true);
+  const delay = Math.min(1500 * attempts, 8000);
+  setTimeout(() => { if (device && !userDisconnect && !device.gatt.connected) openGatt(); }, delay);
+}
+
+ui.connect.addEventListener('click', () => {
+  if (device && device.gatt.connected) {
+    userDisconnect = true;
+    device.gatt.disconnect();
+    return;
+  }
+  wasUp = false;
+  attempts = 0;
+  setupError = null;
+  giveUp = false;
+  if (device && !userDisconnect) openGatt();   // the same node again, without the chooser
+  else connect();
+});
+
+// ---------------- state & controls ----------------
+
+function setControls(on) {
+  ui.run.disabled = !on;
+  for (const b of ui.spans) b.disabled = !on;
+  ui.left.disabled = ui.right.disabled = ui.centre.disabled = ui.follow.disabled = !on;
+  ui.interval.disabled = ui.agg.disabled = !on || !info || info.intervalMs === null;   // older firmware: fixed
+  if (!on) {
+    ui.overlay.textContent = 'Connect to a node to see its spectrum';
+    ui.overlay.style.display = '';
+  }
+}
+
+function fmtMHz(hz, digits = 3) { return (hz / 1e6).toFixed(digits) + ' MHz'; }
+function fmtKHz(hz) { return hz >= 1e5 ? (hz / 1e3).toFixed(0) + ' kHz' : (hz / 1e3).toFixed(1) + ' kHz'; }
+
+function onInfo(inf) {
+  const prev = info;
+  info = inf;
+  if (ctrlChr) ui.interval.disabled = ui.agg.disabled = inf.intervalMs === null;
+  if (!prev || prev.gen !== inf.gen || prev.n !== inf.n || prev.startHz !== inf.startHz || prev.stepHz !== inf.stepHz) resetTraces();
+  ui.run.textContent = inf.state === STATE.OFF ? 'Start' : 'Stop';
+  ui.run.classList.toggle('primary', inf.state === STATE.OFF);
+  ui.spans.forEach((b, i) => b.classList.toggle('on', i === inf.span));
+  if (document.activeElement !== ui.centre) ui.centre.value = (inf.centreHz / 1e6).toFixed(3);
+  ui.follow.classList.toggle('on', inf.follow);
+  ui.follow.classList.toggle('primary', inf.follow);
+  if (inf.intervalMs !== null) {
+    ui.interval.value = String(inf.intervalMs);
+    if (ui.interval.value !== String(inf.intervalMs)) {   // set by another client to a value not listed
+      const o = document.createElement('option');
+      o.value = String(inf.intervalMs);
+      o.textContent = inf.intervalMs + ' ms';
+      ui.interval.appendChild(o);
+      ui.interval.value = o.value;
+    }
+    ui.agg.value = String(inf.agg);
+  }
+  $('fRbw').textContent = fmtKHz(inf.rbwHz);
+  $('fStep').textContent = fmtKHz(inf.stepHz);
+  $('fNode').textContent = fmtMHz(inf.nodeHz) + ' / ' + fmtKHz(inf.nodeBwHz);
+  if (inf.state === STATE.OFF) {
+    ui.overlay.textContent = 'Spectrum mode is off: press Start (the mesh pauses while it runs)';
+    ui.overlay.style.display = '';
+  } else if (inf.state === STATE.STARTING) {
+    ui.overlay.textContent = 'Starting…';
+    ui.overlay.style.display = '';
+  } else if (inf.err !== 0) {
+    ui.overlay.textContent = 'Radio error ' + inf.err;
+    ui.overlay.style.display = '';
+  } else {
+    ui.overlay.style.display = 'none';
+  }
+  draw();
+}
+
+ui.run.addEventListener('click', () => {
+  if (!info) return;
+  if (info.state === STATE.OFF) send(CTRL.START);
+  else send(CTRL.STOP);
+});
+ui.spans.forEach((b) => b.addEventListener('click', () => send(CTRL.SPAN, +b.dataset.span)));
+function setCentre(mhz) {
+  mhz = Math.min(960, Math.max(150, mhz));
+  send(CTRL.CENTRE, Math.round(mhz * 1e6));
+}
+ui.centre.addEventListener('change', () => { const v = parseFloat(ui.centre.value); if (isFinite(v)) setCentre(v); });
+ui.centre.addEventListener('keydown', (e) => { if (e.key === 'Enter') ui.centre.blur(); });
+ui.left.addEventListener('click', () => info && setCentre((info.centreHz / 1e6) - SPANS_MHZ[info.span] / 4));
+ui.right.addEventListener('click', () => info && setCentre((info.centreHz / 1e6) + SPANS_MHZ[info.span] / 4));
+ui.follow.addEventListener('click', () => send(CTRL.CENTRE, 0));
+ui.interval.addEventListener('change', () => send(CTRL.INTERVAL, +ui.interval.value));
+ui.agg.addEventListener('change', () => { send(CTRL.AGG, +ui.agg.value); resetTraces(); });
+ui.clear.addEventListener('click', () => { resetTraces(); cursorX = null; scheduleDraw(); });
+ui.more.addEventListener('click', () => {
+  const open = ui.settings.classList.toggle('open');
+  ui.more.setAttribute('aria-expanded', String(open));
+});
+ui.range.addEventListener('change', draw);
+ui.hold.addEventListener('change', () => { hold = null; draw(); });
+
+// ---------------- frames ----------------
+
+let frameSeq = -1, frameBuf = null, frameGot = 0, lastDoneSeq = -1;
+let trace = null, hold = null, lastFrame = null;
+let floorDb = -125, noiseDb = null;
+let frameTimes = [], frameLost = [];
+
+function resetTraces() {
+  trace = hold = lastFrame = null;
+  frameSeq = lastDoneSeq = -1;
+  frameBuf = null;
+  noiseDb = null;
+  wfClear();
+}
+
+function onPacket(dv) {
+  if (!info || dv.byteLength < 4) return;
+  const gen = dv.getUint8(0), seq = dv.getUint8(1), off = dv.getUint8(2), len = dv.byteLength - 3;
+  if (gen !== info.gen) return;   // from before a span or centre change
+  if (seq === frameSeq && !frameBuf) return;   // a repeat of a frame already shown (BlueZ does that with two clients)
+  if (seq !== frameSeq) {
+    if (frameBuf && frameGot > 0) finishFrame();   // the previous one lost a packet: show what came
+    frameSeq = seq;
+    frameBuf = new Uint8Array(info.n).fill(NO_DATA);
+    frameGot = 0;
+  }
+  for (let i = 0; i < len && off + i < info.n; i++) frameBuf[off + i] = dv.getUint8(3 + i);
+  frameGot += len;
+  if (off + len >= info.n) finishFrame();
+}
+
+function finishFrame() {
+  const n = info.n, buf = frameBuf;
+  if (lastDoneSeq >= 0) frameLost.push((frameSeq - lastDoneSeq - 1 + 256) % 256);   // frames the node dropped (link full)
+  else frameLost.push(0);
+  lastDoneSeq = frameSeq;
+  frameBuf = null;
+  frameGot = 0;
+  const dbm = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const v = buf[i];
+    dbm[i] = v === NO_DATA ? (lastFrame ? lastFrame[i] : NaN) : -v / 2;
+  }
+  lastFrame = dbm;
+  const k = +ui.avg.value;
+  if (!trace || trace.length !== n || k === 1) trace = Float32Array.from(dbm);
+  else for (let i = 0; i < n; i++) trace[i] = isNaN(trace[i]) ? dbm[i] : trace[i] + (dbm[i] - trace[i]) / k;
+  const mode = ui.hold.value;
+  if (mode === 'off') hold = null;
+  else if (!hold || hold.length !== n) hold = Float32Array.from(dbm);
+  else for (let i = 0; i < n; i++) {
+    const h = mode === 'decay' ? hold[i] - 0.25 : hold[i];
+    hold[i] = dbm[i] > h || isNaN(h) ? dbm[i] : h;
+  }
+  // noise: median of the frame; the plot's floor follows it in 5 dB steps
+  const sorted = Array.from(dbm).filter((v) => !isNaN(v)).sort((a, b) => a - b);
+  if (sorted.length) {
+    const med = sorted[sorted.length >> 1];
+    noiseDb = noiseDb === null ? med : noiseDb + (med - noiseDb) * 0.1;
+    const want = Math.floor((noiseDb - 10) / 5) * 5;
+    if (Math.abs(want - floorDb) >= 5) floorDb = want;
+  }
+  const now = performance.now();
+  frameTimes.push(now);
+  while (frameTimes.length && now - frameTimes[0] > 2000) { frameTimes.shift(); frameLost.shift(); }
+  wfPush(dbm);
+  scheduleDraw();
+}
+
+// ---------------- drawing ----------------
+
+let drawPending = false;
+function scheduleDraw() {
+  if (drawPending) return;
+  drawPending = true;
+  requestAnimationFrame(() => { drawPending = false; draw(); });
+}
+
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+function fitCanvas(c) {
+  const r = c.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(r.width * dpr)), h = Math.max(1, Math.round(r.height * dpr));
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  return { w, h, dpr };
+}
+
+function niceStep(raw) {
+  const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= raw) return m * p;
+  return 10 * p;
+}
+
+let cursorX = null;   // css px from the plots' left edge, or null
+let PAD_L = 44;       // css px: dB labels on the left (narrower on small screens)
+const PAD_B = 20;     // css px: frequency labels at the bottom
+
+function view() {   // frequency range shown (Hz): the points' cells, edge to edge
+  const lo = info.startHz - info.stepHz / 2;
+  return { lo, hi: lo + info.stepHz * info.n };
+}
+
+function draw() {
+  const c = ui.spec, { w, h, dpr } = fitCanvas(c), g = c.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, w, h);
+  g.scale(dpr, dpr);
+  const W = w / dpr, H = h / dpr;
+  PAD_L = W < 480 ? 36 : 44;
+  const pl = PAD_L, pb = PAD_B, pw = W - pl, ph = H - pb;
+  const range = +ui.range.value, top = floorDb + range;
+  const yOf = (db) => ph - (db - floorDb) / range * ph;
+  g.font = '11px system-ui, sans-serif';
+  g.lineWidth = 1;
+
+  // dB grid
+  g.fillStyle = css('--label');
+  g.strokeStyle = css('--grid');
+  g.textAlign = 'right';
+  g.textBaseline = 'middle';
+  for (let db = Math.ceil(floorDb / 10) * 10; db <= top; db += 10) {
+    const y = Math.round(yOf(db)) + 0.5;
+    g.beginPath(); g.moveTo(pl, y); g.lineTo(W, y); g.stroke();
+    g.fillText(db + '', pl - 6, Math.min(Math.max(y, 6), ph - 4));
+  }
+  g.textAlign = 'right';
+  g.textBaseline = 'top';
+  g.fillText('dBm', pl - 6, ph + 4);
+  if (!info) { drawWaterfall(); return; }
+
+  const { lo, hi } = view();
+  const xOf = (hz) => pl + (hz - lo) / (hi - lo) * pw;
+
+  // node channel
+  const cl = xOf(info.nodeHz - info.nodeBwHz / 2), cr = xOf(info.nodeHz + info.nodeBwHz / 2);
+  if (cr > pl && cl < W) {
+    g.fillStyle = css('--channel');
+    g.fillRect(Math.max(cl, pl), 0, Math.min(cr, W) - Math.max(cl, pl), ph);
+    const cx = Math.round(xOf(info.nodeHz)) + 0.5;
+    if (cx > pl && cx < W) {
+      g.strokeStyle = css('--channel-line');
+      g.setLineDash([3, 3]);
+      g.beginPath(); g.moveTo(cx, 0); g.lineTo(cx, ph); g.stroke();
+      g.setLineDash([]);
+    }
+  }
+
+  // frequency grid
+  const step = niceStep((hi - lo) / Math.max(2, pw / 70));
+  const digits = step >= 1e6 ? 0 : step >= 1e5 ? 1 : step >= 1e4 ? 2 : 3;
+  g.strokeStyle = css('--grid');
+  g.fillStyle = css('--label');
+  g.textAlign = 'center';
+  g.textBaseline = 'top';
+  for (let f = Math.ceil(lo / step) * step; f <= hi; f += step) {
+    const x = Math.round(xOf(f)) + 0.5;
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, ph); g.stroke();
+    g.fillText((f / 1e6).toFixed(digits), Math.min(Math.max(x, pl + 20), W - 20), ph + 4);
+  }
+
+  const n = info.n, xPt = (i) => pl + (i + 0.5) / n * pw;
+  g.save();
+  g.beginPath(); g.rect(pl, 0, pw, ph); g.clip();
+  if (trace) {   // trace: filled, then its line
+    g.beginPath();
+    g.moveTo(xPt(0), ph);
+    for (let i = 0; i < n; i++) g.lineTo(xPt(i), isNaN(trace[i]) ? ph : yOf(trace[i]));
+    g.lineTo(xPt(n - 1), ph);
+    g.closePath();
+    g.fillStyle = css('--fill');
+    g.fill();
+    g.beginPath();
+    for (let i = 0; i < n; i++) { const y = isNaN(trace[i]) ? ph : yOf(trace[i]); i ? g.lineTo(xPt(i), y) : g.moveTo(xPt(i), y); }
+    g.strokeStyle = css('--trace');
+    g.lineWidth = 1.25;
+    g.stroke();
+  }
+  if (hold) {
+    g.beginPath();
+    for (let i = 0; i < n; i++) { const y = isNaN(hold[i]) ? ph : yOf(hold[i]); i ? g.lineTo(xPt(i), y) : g.moveTo(xPt(i), y); }
+    g.strokeStyle = css('--hold');
+    g.lineWidth = 1;
+    g.stroke();
+  }
+  // peak of the current trace
+  let peak = -1;
+  if (trace) for (let i = 0; i < n; i++) if (!isNaN(trace[i]) && (peak < 0 || trace[i] > trace[peak])) peak = i;
+  if (peak >= 0 && noiseDb !== null && trace[peak] > noiseDb + 10) {
+    const x = xPt(peak), y = yOf(trace[peak]);
+    g.fillStyle = css('--text');
+    g.beginPath(); g.moveTo(x, y - 3); g.lineTo(x - 5, y - 11); g.lineTo(x + 5, y - 11); g.closePath(); g.fill();
+    const f = info.startHz + peak * info.stepHz;
+    $('fPeak').textContent = fmtMHz(f) + ' ' + trace[peak].toFixed(1) + ' dBm';
+  } else {
+    $('fPeak').textContent = '–';
+  }
+  // cursor, and its reading in a label at the top of the plot
+  if (cursorX !== null && cursorX >= pl && trace) {
+    const i = Math.min(n - 1, Math.max(0, Math.floor((cursorX - pl) / pw * n)));
+    const x = Math.round(cursorX) + 0.5;
+    g.strokeStyle = css('--cursor');
+    g.lineWidth = 1;
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, ph); g.stroke();
+    const text = ((info.startHz + i * info.stepHz) / 1e6).toFixed(3) + ' MHz  ' + (isNaN(trace[i]) ? '–' : trace[i].toFixed(1) + ' dBm');
+    g.font = '12px system-ui, sans-serif';
+    const tw = g.measureText(text).width + 12, th = 20;
+    const bx = Math.min(Math.max(x - tw / 2, pl + 2), W - tw - 2);
+    g.fillStyle = css('--panel');
+    g.globalAlpha = 0.9;
+    g.fillRect(bx, 4, tw, th);
+    g.globalAlpha = 1;
+    g.strokeStyle = css('--line');
+    g.strokeRect(bx + 0.5, 4.5, tw - 1, th - 1);
+    g.fillStyle = css('--text');
+    g.textAlign = 'left';
+    g.textBaseline = 'middle';
+    g.fillText(text, bx + 6, 4 + th / 2);
+  }
+  g.restore();
+
+  $('fNoise').textContent = noiseDb === null ? '–' : noiseDb.toFixed(1) + ' dBm';
+  if (frameTimes.length > 1) {
+    const lost = frameLost.slice(1).reduce((a, b) => a + b, 0), got = frameTimes.length - 1;
+    $('fFps').textContent = (got / ((frameTimes[got] - frameTimes[0]) / 1000)).toFixed(1) + '/s' +
+      (lost ? ' · ' + Math.round(100 * lost / (lost + got)) + '% lost' : '');
+  } else {
+    $('fFps').textContent = '–';
+  }
+  drawWaterfall();
+}
+
+// waterfall: one row per frame into an offscreen canvas (one pixel per point), scaled onto the plot
+const wfOff = document.createElement('canvas');
+let wfCtx = null, wfRows = 0;
+const PALETTE = (() => {   // dark blue -> blue -> cyan -> yellow -> red -> white
+  const stops = [[0, 0, 0, 24], [0.25, 20, 40, 160], [0.45, 0, 170, 210], [0.65, 240, 220, 40], [0.85, 230, 40, 20], [1, 255, 255, 255]];
+  const p = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let k = 0;
+    while (k < stops.length - 2 && t > stops[k + 1][0]) k++;
+    const a = stops[k], b = stops[k + 1], u = (t - a[0]) / (b[0] - a[0]);
+    for (let j = 0; j < 3; j++) p[i * 3 + j] = a[j + 1] + (b[j + 1] - a[j + 1]) * u;
+  }
+  return p;
+})();
+
+function wfClear() {
+  wfRows = 0;
+  if (wfCtx) wfCtx.clearRect(0, 0, wfOff.width, wfOff.height);
+}
+
+function wfPush(dbm) {
+  const n = dbm.length;
+  // history: at least as many rows as the plot has device pixels (it grows with the window, keeping what it has)
+  const rows = Math.max(wfOff.width === n ? wfOff.height : 0, 1024, Math.ceil(ui.wf.getBoundingClientRect().height * (window.devicePixelRatio || 1)));
+  if (wfOff.width !== n || wfOff.height !== rows) {
+    let old = null;
+    if (wfCtx && wfOff.width === n && wfRows) {
+      old = document.createElement('canvas');
+      old.width = n;
+      old.height = wfOff.height;
+      old.getContext('2d').drawImage(wfOff, 0, 0);
+    } else {
+      wfRows = 0;
+    }
+    wfOff.width = n;
+    wfOff.height = rows;
+    wfCtx = wfOff.getContext('2d');
+    if (old) wfCtx.drawImage(old, 0, 0);
+  }
+  wfCtx.drawImage(wfOff, 0, 0, n, rows - 1, 0, 1, n, rows - 1);   // scroll down by a row
+  const row = wfCtx.createImageData(n, 1);
+  const lo = (noiseDb === null ? -120 : noiseDb) + 2, span = 40;
+  for (let i = 0; i < n; i++) {
+    const v = dbm[i];
+    const t = isNaN(v) ? 0 : Math.min(255, Math.max(0, Math.round((v - lo) / span * 255)));
+    row.data[i * 4] = PALETTE[t * 3]; row.data[i * 4 + 1] = PALETTE[t * 3 + 1]; row.data[i * 4 + 2] = PALETTE[t * 3 + 2];
+    row.data[i * 4 + 3] = 255;
+  }
+  wfCtx.putImageData(row, 0, 0);
+  if (wfRows < rows) wfRows++;
+}
+
+function drawWaterfall() {
+  const c = ui.wf, { w, h, dpr } = fitCanvas(c), g = c.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.fillStyle = PALETTE_BG;
+  g.fillRect(0, 0, w, h);
+  if (!wfCtx || !wfRows) return;
+  const pl = Math.round(PAD_L * dpr), rows = Math.min(wfRows, h);
+  g.imageSmoothingEnabled = false;
+  g.drawImage(wfOff, 0, 0, wfOff.width, rows, pl, 0, w - pl, rows);   // a row per frame, newest on top
+  if (cursorX !== null && cursorX >= PAD_L) {
+    const x = Math.round(cursorX * dpr) + 0.5;
+    g.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+    g.lineWidth = dpr;
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke();
+  }
+}
+const PALETTE_BG = 'rgb(0, 0, 24)';
+
+// ---------------- interaction ----------------
+
+// Mouse: the cursor follows the pointer, a double click centres the view there.
+// Touch: a tap or a drag sets the cursor (it stays), a double tap centres the view there.
+let lastTap = 0, lastTapX = 0, lastTouch = 0;
+function localX(e, c) { return e.clientX - c.getBoundingClientRect().left; }
+function centreAt(x) {
+  if (!info || !ctrlChr || x < PAD_L) return;
+  const { lo, hi } = view(), pw = ui.spec.clientWidth - PAD_L;
+  setCentre((lo + (x - PAD_L) / pw * (hi - lo)) / 1e6);
+}
+for (const c of [ui.spec, ui.wf]) {
+  c.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse') return;
+    lastTouch = performance.now();
+    try { c.setPointerCapture(e.pointerId); } catch (_) { /* not an active pointer */ }
+    cursorX = localX(e, c);
+    scheduleDraw();
+  });
+  c.addEventListener('pointermove', (e) => {
+    if (e.pointerType !== 'mouse' && !e.buttons && !c.hasPointerCapture(e.pointerId)) return;
+    cursorX = localX(e, c);
+    scheduleDraw();
+  });
+  c.addEventListener('pointerleave', (e) => {
+    if (e.pointerType === 'mouse') { cursorX = null; scheduleDraw(); }
+  });
+  c.addEventListener('pointerup', (e) => {
+    if (e.pointerType === 'mouse') return;
+    const now = performance.now(), x = localX(e, c);
+    lastTouch = now;
+    if (now - lastTap < 350 && Math.abs(x - lastTapX) < 24) {
+      centreAt(x);
+      lastTap = 0;
+    } else {
+      lastTap = now;
+      lastTapX = x;
+    }
+  });
+  c.addEventListener('dblclick', (e) => {
+    if (performance.now() - lastTouch > 800) centreAt(localX(e, c));   // touch has its own double tap
+  });
+}
+if (window.ResizeObserver) new ResizeObserver(scheduleDraw).observe(document.querySelector('main'));
+window.addEventListener('resize', scheduleDraw);
+if (window.matchMedia) window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', scheduleDraw);
+draw();
+</script>
+</body>
+</html>

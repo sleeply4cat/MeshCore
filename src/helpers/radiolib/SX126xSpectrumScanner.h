@@ -30,6 +30,8 @@ class SX126xSpectrumScanner {
   bool _active;
   SPISettings _saved_spi;
 
+public:
+  // the RX bandwidth used for a requested RBW (kHz)
   static float pickRxBw(float khz) {
     static const float bws[] = { 4.8, 5.8, 7.3, 9.7, 11.7, 14.6, 19.5, 23.4, 29.3, 39.0, 46.9, 58.6,
                                  78.2, 93.8, 117.3, 156.2, 187.2, 234.3, 312.0, 373.6, 467.0 };
@@ -39,7 +41,6 @@ class SX126xSpectrumScanner {
     return 467.0;
   }
 
-public:
   enum { MAX_POINTS = 250 };   // + latency <= 255 updates per command
 
   SX126xSpectrumScanner(SX1262* radio) : _radio(radio), _num_points(0), _active(false) { }

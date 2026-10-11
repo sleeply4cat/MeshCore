@@ -7,6 +7,16 @@
 #define BLE_TX_POWER 4
 #endif
 
+// Peripheral connections: more than 1 lets other clients (eg. the spectrum page, SpectrumBLEService) connect next
+// to the app. The app's connection is the one using the UART service; the others don't touch it.
+#ifndef BLE_MAX_CONNECTIONS
+#define BLE_MAX_CONNECTIONS 1
+#endif
+// notifications the SoftDevice queues per connection (3 by default): more for streams (SpectrumBLEService)
+#ifndef BLE_HVN_QUEUE_SIZE
+#define BLE_HVN_QUEUE_SIZE 3
+#endif
+
 class SerialBLEInterface : public BaseSerialInterface {
   BLEDfu bledfu;
   BLEUart bleuart;
@@ -34,6 +44,10 @@ class SerialBLEInterface : public BaseSerialInterface {
   void shiftRecvQueueLeft();
   bool isValidConnection(uint16_t handle, bool requireWaitingForSecurity = false) const;
   bool isAdvertising() const;
+  bool hasAppConnection() const;
+  void adoptConnection(uint16_t handle);
+  void restartAdvertising();
+  static void requestConnParams(uint16_t handle);
   static void onConnect(uint16_t connection_handle);
   static void onDisconnect(uint16_t connection_handle, uint8_t reason);
   static void onSecured(uint16_t connection_handle);
@@ -41,6 +55,7 @@ class SerialBLEInterface : public BaseSerialInterface {
   static void onPairingComplete(uint16_t connection_handle, uint8_t auth_status);
   static void onBLEEvent(ble_evt_t* evt);
   static void onBleUartRX(uint16_t conn_handle);
+  static void onBleUartNotify(uint16_t conn_handle, bool enabled);
 
 public:
   SerialBLEInterface() {
