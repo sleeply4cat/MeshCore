@@ -26,6 +26,10 @@ MultiSerialInterface interface_manager;
     // include nrf52 bluetooth interface
     #include <helpers/nrf52/SerialBLEInterface.h>
     SerialBLEInterface bluetooth_interface;
+    #if SPECTRUM_BLE
+      #include <helpers/nrf52/SpectrumBLEService.h>
+      SpectrumBLEService spectrum_ble;   // next to the app's UART service, see ui-new SpectrumScreen
+    #endif
   #else
     #error "SerialBLEInterface is not defined for this platform"
   #endif
@@ -187,6 +191,9 @@ void setup() {
 // add bluetooth interface
 #if defined(BLE_PIN_CODE)
   bluetooth_interface.begin(BLE_NAME_PREFIX, the_mesh.getNodePrefs()->node_name, the_mesh.getBLEPin());
+  #if SPECTRUM_BLE
+  spectrum_ble.begin();   // after Bluefruit's start, before advertising
+  #endif
   interface_manager.addInterface(InterfaceType::Bluetooth, &bluetooth_interface);
 #endif
 

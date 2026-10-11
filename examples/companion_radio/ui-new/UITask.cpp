@@ -617,10 +617,20 @@ public:
 #define SPECTRUM_WF_LO       3       // waterfall: dB above noise where the grey scale starts
 #define SPECTRUM_WF_RANGE    32      //            and its span in dB, up to solid black
 
+#if SPECTRUM_BLE
+  #include <helpers/nrf52/SpectrumBLEService.h>
+  extern SpectrumBLEService spectrum_ble;
+  #ifndef SPECTRUM_BLE_FRAME_MS
+    #define SPECTRUM_BLE_FRAME_MS  50   // default interval of the frames sent over BLE (the client can change it)
+  #endif
+#endif
+
 // SDR-like view of the band around the mesh frequency: live spectrum with decaying peak-hold, plus a waterfall.
 // Sweeps run continuously in their own RTOS task, so they don't stop while the display is drawn or refreshed;
 // each display frame shows the maximum seen at each point since the previous frame, so short bursts aren't lost.
 // The mesh is paused while this screen owns the radio (the app is still served).
+// With SPECTRUM_BLE, the sweeps also go to a BLE client (SpectrumBLEService), which can open and close this
+// screen and set its span and centre.
 class SpectrumScreen : public UIScreen {
   UITask* _task;
   NodePrefs* _prefs;
@@ -628,7 +638,9 @@ class SpectrumScreen : public UIScreen {
   SX126xSpectrumScanner _scanner;
   bool _pending_start, _need_wipe;
   uint8_t _span_idx;
-  float _freq, _bw;      // the mesh channel shown; follows the node's prefs (render())
+  float _freq, _bw;      // the mesh channel shown; follows the node's prefs (poll())
+  float _center;         // centre of the view: the mesh channel, unless set over BLE
+  bool _follow;          // _center follows _freq
 
   // shared with the scan task
   TaskHandle_t _scan_task;
@@ -638,6 +650,17 @@ class SpectrumScreen : public UIScreen {
   volatile int16_t _cur[SPECTRUM_POINTS];    // latest sweep, dBm
   volatile int16_t _fmax[SPECTRUM_POINTS];   // max since the last display frame
   volatile int16_t _sweep_err;               // of the latest sweep, RADIOLIB_ERR_NONE if it went fine
+#if SPECTRUM_BLE
+  // scan task only: the sweeps since the last BLE frame, aggregated as it says (AGG_*)
+  uint8_t _ble_min[SPECTRUM_POINTS];         // strongest level (-2 * dBm, as the radio's)
+  float _ble_sum[SPECTRUM_POINTS];           // sum of linear power
+  float _ble_lin[256];                       // level -> linear power
+  uint16_t _ble_count;
+  uint8_t _ble_agg_cur;
+  uint32_t _ble_at;
+  volatile uint16_t _ble_ms;                 // frame interval, 0: every sweep
+  volatile uint8_t _ble_agg;
+#endif
 
   // display side
   int _w, _scale_y, _graph_y, _graph_h, _wf_y, _wf_rows, _wf_stride, _wf_head, _wf_count;
@@ -676,7 +699,7 @@ class SpectrumScreen : public UIScreen {
     static const float steps[] = { 3.0f, 2.0f, 2.0f, 1.5f };
     return steps[idx % 4];
   }
-  float edgeMHz(uint8_t idx) const { return _freq - spanMHz(idx) / 2; }
+  float edgeMHz(uint8_t idx) const { return _center - spanMHz(idx) / 2; }
 
   // --- scan task ---
 
@@ -687,7 +710,53 @@ class SpectrumScreen : public UIScreen {
     float step = spanMHz(idx) / n;
     _scanner.setSweep(edgeMHz(idx) + step / 2, step, n, step * 1000.0f * spanRbwSteps(idx));
     for (int i = 0; i < SPECTRUM_POINTS; i++) _cur[i] = _fmax[i] = SPECTRUM_NO_SIGNAL;
+  #if SPECTRUM_BLE
+    bleReset();
+  #endif
   }
+
+#if SPECTRUM_BLE
+  // From the scan task: not held up by the display's refresh, which blocks the UI loop
+  void bleReset() {
+    memset(_ble_min, 0xFF, sizeof(_ble_min));
+    memset(_ble_sum, 0, sizeof(_ble_sum));
+    _ble_count = 0;
+  }
+
+  void bleSweep(const uint8_t* level, int n, uint8_t gen) {
+    uint8_t agg = _ble_agg;
+    if (agg != _ble_agg_cur) {
+      _ble_agg_cur = agg;
+      bleReset();
+    }
+    if (agg == SpectrumBLEService::AGG_MAX) {
+      for (int i = 0; i < n; i++) if (level[i] < _ble_min[i]) _ble_min[i] = level[i];
+    } else if (agg == SpectrumBLEService::AGG_MEAN) {
+      for (int i = 0; i < n; i++) _ble_sum[i] += _ble_lin[level[i]];
+    }
+    _ble_count++;
+    uint32_t now = millis();
+    uint16_t ms = _ble_ms;
+    if (ms) {
+      if (now - _ble_at < ms) return;
+      _ble_at = now - _ble_at < 2u * ms ? _ble_at + ms : now;   // on a steady beat
+    }
+    if (spectrum_ble.hasSubscribers()) {
+      const uint8_t* out = level;   // AGG_LAST
+      if (agg == SpectrumBLEService::AGG_MAX) {
+        out = _ble_min;
+      } else if (agg == SpectrumBLEService::AGG_MEAN) {
+        for (int i = 0; i < n; i++) {
+          int v = (int)(-20.0f * log10f(_ble_sum[i] / _ble_count) + 0.5f);
+          _ble_min[i] = v < 0 ? 0 : (v > 254 ? 254 : v);
+        }
+        out = _ble_min;
+      }
+      spectrum_ble.sendFrame(gen, out, n);
+    }
+    bleReset();
+  }
+#endif
 
   void scanLoop() {
     uint8_t level[SPECTRUM_POINTS];
@@ -712,6 +781,9 @@ class SpectrumScreen : public UIScreen {
         if (a > _fmax[i]) _fmax[i] = a;
       }
       xTaskResumeAll();
+    #if SPECTRUM_BLE
+      bleSweep(level, n, gen);
+    #endif
     }
     _task_running = false;
     vTaskDelete(NULL);
@@ -892,9 +964,12 @@ class SpectrumScreen : public UIScreen {
     }
     // mesh channel: dotted centre line, and its bandwidth on the baseline
     int cx = freqToX(_freq);
-    for (int y = _graph_y; y < bottom; y += 3) d.fillRectNative(cx, y, 1, 1);
     int half_bw = (int)(_bw / 2000.0f / spanMHz(_span_idx) * _w);
-    d.fillRectNative(cx - half_bw, bottom + 1, half_bw * 2 + 1, 2);
+    if (cx >= 0 && cx < _w) {
+      for (int y = _graph_y; y < bottom; y += 3) d.fillRectNative(cx, y, 1, 1);
+    }
+    int bl = cx - half_bw < 0 ? 0 : cx - half_bw, br = cx + half_bw >= _w ? _w - 1 : cx + half_bw;
+    if (br >= bl) d.fillRectNative(bl, bottom + 1, br - bl + 1, 2);
   }
 
   void renderWaterfall(DisplayDriver& d) {
@@ -936,9 +1011,18 @@ class SpectrumScreen : public UIScreen {
 public:
   SpectrumScreen(UITask* task, NodePrefs* prefs)
       : _task(task), _prefs(prefs), _display(NULL), _scanner(&radio), _pending_start(false), _need_wipe(false), _span_idx(1),
-        _run(false), _task_running(false), _span_req(1), _cfg_gen(0), _cfg_applied(0), _wf_mem(NULL), _wf(NULL), _wf_err(NULL), _wf_err_next(NULL) { }
+        _follow(true), _run(false), _task_running(false), _span_req(1), _cfg_gen(0), _cfg_applied(0), _wf_mem(NULL), _wf(NULL), _wf_err(NULL), _wf_err_next(NULL)
+      #if SPECTRUM_BLE
+        , _ble_agg_cur(0), _ble_ms(SPECTRUM_BLE_FRAME_MS), _ble_agg(SpectrumBLEService::AGG_MAX)
+      #endif
+        {
+  #if SPECTRUM_BLE
+    for (int l = 0; l < 256; l++) _ble_lin[l] = powf(10.0f, -l / 20.0f);   // -2 * dBm -> mW
+  #endif
+  }
 
   bool ownsRadio() const { return _scanner.isActive(); }
+  bool isOpen() const { return _wf != NULL; }   // between start() and stop()
 
   void start(DisplayDriver& d) {
     if (_wf == NULL && !allocBuffers(d)) {
@@ -947,11 +1031,13 @@ public:
     }
     _freq = _prefs->freq;
     _bw = _prefs->bw;
+    if (_follow) _center = _freq;
+    _span_req = _span_idx;
     _sweep_err = RADIOLIB_ERR_NONE;
     _frame_noise = -115;
     _floor_dbm = -125;
     _peak = _hdr_peak = -1;
-    _peak_mhz = _freq;
+    _peak_mhz = _center;
     for (int i = 0; i < SPECTRUM_POINTS; i++) _cur[i] = _fmax[i] = SPECTRUM_NO_SIGNAL;
     clearHistory();
     _display = &d;
@@ -959,6 +1045,7 @@ public:
   }
 
   void stop() {
+    if (!isOpen()) return;   // already stopped (or never started)
     _pending_start = false;
     if (_task_running && !stopScanTask()) {
       board.reboot();   // restoring the radio under the stuck task's feet could leave it in any state
@@ -972,6 +1059,15 @@ public:
   }
 
   void poll() override {
+    if (_scanner.isActive() && (_prefs->freq != _freq || _prefs->bw != _bw)) {   // the node's channel changed (eg.
+      _freq = _prefs->freq;                                                        // from the app): follow it,
+      _bw = _prefs->bw;                                                            // without a wipe of the panel
+      if (_follow) {
+        _center = _freq;
+        _peak_mhz = _freq;
+        changeSpan(_span_idx, false);
+      }
+    }
     if (!_pending_start || !radio_driver.isIdleInRecvMode()) return;   // not mid-TX, mid-RX or with a packet to read
     _pending_start = false;
   #ifdef SX126X_DIO3_TCXO_VOLTAGE
@@ -994,6 +1090,9 @@ public:
       return;
     }
     _header_at = millis();
+  #if SPECTRUM_BLE
+    _ble_at = millis();
+  #endif
     _display->setFastRefresh(true);
     _need_wipe = true;
   }
@@ -1006,12 +1105,6 @@ public:
     if (!_scanner.isActive()) {
       d.drawTextCentered(d.width() / 2, 20, _pending_start ? "waiting for radio..." : "spectrum stopped");
       return 200;
-    }
-    if (_prefs->freq != _freq || _prefs->bw != _bw) {   // the node's channel changed (eg. from the app): follow it,
-      _freq = _prefs->freq;                               // without a wipe of the panel
-      _bw = _prefs->bw;
-      _peak_mhz = _freq;
-      changeSpan(_span_idx, false);
     }
     if (_need_wipe) {   // start from a clean panel: on entry and when the span changes
       d.wipe();
@@ -1079,6 +1172,95 @@ public:
     }
     return false;
   }
+
+#if SPECTRUM_BLE
+  // From the UI loop, whatever the screen: the BLE client's requests, and the state it sees
+  void bleLoop() {
+    SpectrumBLEService::Request req;
+    while (spectrum_ble.takeRequest(req)) {
+      bool has_arg = req.arg != 0xFFFFFFFF;
+      switch (req.op) {
+        case SpectrumBLEService::CTRL_START:
+          if (has_arg) setSpan(req.arg);
+          if (!isOpen()) _task->gotoSpectrumScreen();
+          break;
+        case SpectrumBLEService::CTRL_STOP:
+          if (isOpen()) {
+            _task->showAlert("Mesh radio resumed", 1000);
+            _task->gotoHomeScreen();
+          }
+          break;
+        case SpectrumBLEService::CTRL_SPAN:
+          if (has_arg) setSpan(req.arg);
+          break;
+        case SpectrumBLEService::CTRL_INTERVAL:
+          if (has_arg && ((req.arg & 0xFFFF) == 0 || ((req.arg & 0xFFFF) >= 10 && (req.arg & 0xFFFF) <= 2000))) {
+            _ble_ms = req.arg & 0xFFFF;
+          }
+          break;
+        case SpectrumBLEService::CTRL_AGG:
+          if (has_arg && req.arg <= SpectrumBLEService::AGG_LAST) _ble_agg = req.arg;
+          break;
+        case SpectrumBLEService::CTRL_CENTRE:
+          if (!has_arg) break;
+          if (req.arg == 0) {
+            _follow = true;
+            _center = _freq;
+          } else if (req.arg >= 150000000 && req.arg <= 960000000) {
+            _follow = false;
+            _center = req.arg / 1e6f;
+          } else {
+            break;
+          }
+          if (isOpen()) {
+            _peak_mhz = _center;
+            changeSpan(_span_idx, false);
+          }
+          break;
+      }
+    }
+    publishInfo();
+  }
+
+  void setSpan(uint32_t idx) {
+    if (idx > 3) return;
+    if (isOpen()) {
+      if (idx != _span_idx) changeSpan(idx);
+    } else {
+      _span_idx = idx;
+    }
+  }
+
+  static void put32(uint8_t* p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+
+  void publishInfo() {
+    uint8_t info[SpectrumBLEService::INFO_LEN];
+    memset(info, 0, sizeof(info));
+    float node = _prefs->freq, center = !isOpen() && _follow ? node : _center;
+    int n = spanPoints(_span_idx);
+    double step = spanMHz(_span_idx) / n;
+    info[0] = 1;
+    info[1] = !isOpen() ? SpectrumBLEService::STATE_OFF
+            : (_scanner.isActive() ? SpectrumBLEService::STATE_RUNNING : SpectrumBLEService::STATE_STARTING);
+    info[2] = _span_idx;
+    info[3] = n;
+    put32(&info[4], (uint32_t)((center - spanMHz(_span_idx) / 2 + step / 2) * 1e6 + 0.5));
+    put32(&info[8], (uint32_t)(step * 1e6 + 0.5));
+    put32(&info[12], (uint32_t)(SX126xSpectrumScanner::pickRxBw(step * 1000.0 * spanRbwSteps(_span_idx)) * 1000 + 0.5f));
+    put32(&info[16], (uint32_t)(center * 1e6 + 0.5));
+    put32(&info[20], (uint32_t)(node * 1e6 + 0.5));
+    put32(&info[24], (uint32_t)(_prefs->bw * 1000 + 0.5f));
+    int16_t err = isOpen() ? _sweep_err : 0;
+    info[28] = err;
+    info[29] = err >> 8;
+    info[30] = _cfg_gen;
+    info[31] = _follow ? SpectrumBLEService::FLAG_FOLLOW : 0;
+    info[32] = _ble_ms;
+    info[33] = _ble_ms >> 8;
+    info[34] = _ble_agg;
+    spectrum_ble.setInfo(info);
+  }
+#endif
 };
 #endif
 
@@ -1357,6 +1539,9 @@ void UITask::loop() {
 #endif
 
   if (curr) curr->poll();
+#if UI_SPECTRUM_PAGE == 1 && SPECTRUM_BLE
+  ((SpectrumScreen *) spectrum)->bleLoop();
+#endif
 
   if (_display != NULL && _display->isOn()) {
     if (millis() >= _next_refresh && curr) {
