@@ -733,6 +733,13 @@ bool UITask::isButtonPressed() const {
 #endif
 }
 
+void UITask::setRadioBusy(bool busy) {
+  if (busy == _radio_busy) return;
+  _radio_busy = busy;
+  _radio_busy_shown = false;
+  _next_refresh = 0;   // back to the current screen right away
+}
+
 void UITask::loop() {
   char c = 0;
 #if UI_HAS_JOYSTICK
@@ -822,7 +829,18 @@ void UITask::loop() {
   if (curr) curr->poll();
 
   if (_display != NULL && _display->isOn()) {
-    if (millis() >= _next_refresh && curr) {
+    if (_radio_busy) {   // one notice, then no refreshes until the radio is back
+      if (!_radio_busy_shown) {
+        _display->startFrame();
+        _display->setTextSize(1);
+        _display->setColor(UIColor::title_txt);
+        _display->drawTextCentered(_display->width() / 2, _display->height() / 3, "Spectrum stream");
+        _display->setColor(UIColor::primary_txt);
+        _display->drawTextCentered(_display->width() / 2, _display->height() / 2, "mesh paused");
+        _display->endFrame();
+        _radio_busy_shown = true;
+      }
+    } else if (millis() >= _next_refresh && curr) {
       _display->startFrame();
       int delay_millis = curr->render(*_display);
       if (millis() < _alert_expiry) {  // render alert popup

@@ -43,4 +43,7 @@ public:
   virtual void newMsg(uint8_t path_len, const char* from_name, const char* text, int msgcount) = 0;
   virtual void notify(UIEventType t = UIEventType::none) = 0;
   virtual void loop() = 0;
+  // The radio is away from the mesh (a spectrum session): a UI can say so, and should hold its refreshes
+  // meanwhile, since a display refresh blocks the main loop that serves the stream.
+  virtual void setRadioBusy(bool busy) { }
 };

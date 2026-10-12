@@ -25,6 +25,7 @@
 
 #include "DataStore.h"
 #include "NodePrefs.h"
+#include "SpectrumSession.h"
 
 #include <RTClib.h>
 #include <helpers/ArduinoHelpers.h>
@@ -210,6 +211,7 @@ private:
 
   DataStore* _store;
   NodePrefs _prefs;
+  SpectrumSession _spectrum { &_prefs };   // CMD_SPECTRUM
   uint32_t pending_login;
   uint32_t pending_status;
   uint32_t pending_telemetry, pending_discovery;   // pending _TELEMETRY_REQ

@@ -32,6 +32,7 @@ class UITask : public AbstractUITask {
   GenericVibration vibration;
 #endif
   unsigned long _next_refresh, _auto_off;
+  bool _radio_busy = false, _radio_busy_shown = false;
   NodePrefs* _node_prefs;
   char _alert[80];
   unsigned long _alert_expiry;
@@ -96,6 +97,7 @@ public:
   void newMsg(uint8_t path_len, const char* from_name, const char* text, int msgcount) override;
   void notify(UIEventType t = UIEventType::none) override;
   void loop() override;
+  void setRadioBusy(bool busy) override;
 
   void shutdown(bool restart = false);
 };

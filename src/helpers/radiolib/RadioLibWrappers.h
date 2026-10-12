@@ -32,6 +32,7 @@ public:
   RadioLibWrapper(PhysicalLayer& radio, mesh::MainBoard& board) : _radio(&radio), _board(&board), _preamble_sf(0) { n_recv = n_sent = 0; }
 
   void begin() override;
+  void onExternalReinit();   // call after the radio chip was reset/reconfigured outside of this wrapper
   virtual void powerOff() { _radio->sleep(); }
   int recvRaw(uint8_t* bytes, int sz) override;
   uint32_t getEstAirtimeFor(int len_bytes) override;
@@ -39,6 +40,7 @@ public:
   bool isSendComplete() override;
   void onSendFinished() override;
   bool isInRecvMode() const override;
+  bool isIdleInRecvMode();   // in RX, with no packet arriving or waiting to be read: safe to take the radio
   bool isChannelActive();
 
   bool isReceiving() override {

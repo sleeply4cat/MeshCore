@@ -1402,7 +1402,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       _prefs.setRepeatEn(repeat != 0);
       savePrefs();
 
-      radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+      if (!_spectrum.ownsRadio()) radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);   // else when the spectrum session ends
       MESH_DEBUG_PRINTLN("OK: CMD_SET_RADIO_PARAMS: f=%d, bw=%d, sf=%d, cr=%d", freq, bw, (uint32_t)sf,
                          (uint32_t)cr);
 
@@ -1419,7 +1419,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       _prefs.tx_power_dbm = power;
       savePrefs();
-      radio_driver.setTxPower(_prefs.tx_power_dbm);
+      if (!_spectrum.ownsRadio()) radio_driver.setTxPower(_prefs.tx_power_dbm);   // else when the spectrum session ends
       writeOKFrame();
     }
   } else if (cmd_frame[0] == CMD_SET_TUNING_PARAMS) {
@@ -1881,8 +1881,9 @@ void MyMesh::handleCmdFrame(size_t len) {
       out_frame[i++] = RESP_CODE_STATS;
       out_frame[i++] = STATS_TYPE_RADIO;
       int16_t noise_floor = (int16_t)_radio->getNoiseFloor();
-      int8_t last_rssi = (int8_t)radio_driver.getLastRSSI();
-      int8_t last_snr = (int8_t)(radio_driver.getLastSNR() * 4); // scaled by 4 for 0.25 dB precision
+      // read from the radio, unless a spectrum session has it
+      int8_t last_rssi = _spectrum.ownsRadio() ? 0 : (int8_t)radio_driver.getLastRSSI();
+      int8_t last_snr = _spectrum.ownsRadio() ? 0 : (int8_t)(radio_driver.getLastSNR() * 4); // scaled by 4 for 0.25 dB precision
       uint32_t tx_air_secs = getTotalAirTime() / 1000;
       uint32_t rx_air_secs = getReceiveAirTime() / 1000;
       memcpy(&out_frame[i], &noise_floor, 2); i += 2;
@@ -2007,6 +2008,10 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_TABLE_FULL);
     }
+  } else if (cmd_frame[0] == SpectrumSession::CMD_SPECTRUM) {
+    int n = _spectrum.handleCommand(cmd_frame, len, out_frame);
+    if (n > 0) _serial->writeFrame(out_frame, n);
+    else writeErrFrame(-n);
   } else {
     writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
     MESH_DEBUG_PRINTLN("ERROR: unknown command: %02X", cmd_frame[0]);
@@ -2227,7 +2232,7 @@ void MyMesh::checkSerialInterface() {
 }
 
 void MyMesh::loop() {
-  BaseChatMesh::loop();
+  if (!_spectrum.ownsRadio()) BaseChatMesh::loop();   // paused while a spectrum session has the radio
 
   if (_cli_rescue) {
     checkCLIRescueCmd();
@@ -2243,7 +2248,13 @@ void MyMesh::loop() {
 
 #ifdef DISPLAY_CLASS
   if (_ui) _ui->setHasConnection(_serial->isConnected());
+  if (_ui) _ui->setRadioBusy(_spectrum.ownsRadio());
 #endif
+
+  if (_spectrum.isActive()) {
+    _spectrum.loop(_serial);
+    delay(1);   // no sleep during a session (see hasPendingWork()), but the scan task needs the CPU too
+  }
 }
 
 bool MyMesh::advert() {
@@ -2263,5 +2274,5 @@ bool MyMesh::advert() {
 
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
-  return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0;
+  return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0 || _spectrum.isActive();
 }
