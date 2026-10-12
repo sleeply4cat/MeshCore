@@ -24,6 +24,7 @@
 
 #include "DataStore.h"
 #include "NodePrefs.h"
+#include "LoraScan.h"
 
 #include <RTClib.h>
 #include <helpers/ArduinoHelpers.h>
@@ -241,6 +242,7 @@ private:
 
   DataStore* _store;
   NodePrefs _prefs;
+  LoraScan _scan { &_prefs };   // CMD_LORA_SCAN
   uint32_t pending_login;
   uint32_t pending_status;
   uint32_t pending_telemetry, pending_discovery;   // pending _TELEMETRY_REQ

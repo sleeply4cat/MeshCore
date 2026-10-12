@@ -1447,7 +1447,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       _prefs.setRepeatEn(repeat != 0);
       savePrefs();
 
-      radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+      if (!_scan.ownsRadio()) radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);   // else when the scan ends
       MESH_DEBUG_PRINTLN("OK: CMD_SET_RADIO_PARAMS: f=%d, bw=%d, sf=%d, cr=%d", freq, bw, (uint32_t)sf,
                          (uint32_t)cr);
 
@@ -1464,7 +1464,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       _prefs.tx_power_dbm = power;
       savePrefs();
-      radio_driver.setTxPower(_prefs.tx_power_dbm);
+      if (!_scan.ownsRadio()) radio_driver.setTxPower(_prefs.tx_power_dbm);   // else when the scan ends
       writeOKFrame();
     }
   } else if (cmd_frame[0] == CMD_SET_TUNING_PARAMS) {
@@ -2056,6 +2056,10 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_TABLE_FULL);
     }
+  } else if (cmd_frame[0] == LoraScan::CMD_LORA_SCAN) {
+    int err = _scan.handleCommand(cmd_frame, len);
+    if (err == 0) writeOKFrame();
+    else writeErrFrame(err);
   } else {
     writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
     MESH_DEBUG_PRINTLN("ERROR: unknown command: %02X", cmd_frame[0]);
@@ -2413,7 +2417,7 @@ void MyMesh::checkSerialInterface() {
 }
 
 void MyMesh::loop() {
-  BaseChatMesh::loop();
+  if (!_scan.ownsRadio()) BaseChatMesh::loop();   // the mesh pauses while a LoRa scan has the radio
 
   if (_cli_rescue) {
     checkCLIRescueCmd();
@@ -2425,6 +2429,8 @@ void MyMesh::loop() {
     checkCLIRescueCmd();
 #endif
   }
+
+  _scan.loop(_serial);
 
   // is there are pending dirty contacts write needed?
   if (dirty_contacts_expiry && millisHasNowPassed(dirty_contacts_expiry)) {
@@ -2450,5 +2456,5 @@ bool MyMesh::advert() {
 
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
-  return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0;
+  return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0 || _scan.isActive();
 }
