@@ -69,5 +69,7 @@ public:
   int nativeHeight() override;
   int toNativeY(int y) override;
   void fillRectNative(int x, int y, int w, int h) override;
+  bool hasColor() override { return true; }
+  void drawRgbRowNative(int x, int y, const uint16_t* rgb, int w) override;
   void endFrame() override;
 };

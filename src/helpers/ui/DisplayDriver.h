@@ -42,6 +42,10 @@ public:
   virtual int nativeHeight() { return height(); }
   virtual int toNativeY(int y) { return y; }
   virtual void fillRectNative(int x, int y, int w, int h) { fillRect(x, y, w, h); }
+  // colour panels: a row of RGB565 pixels at native coordinates, in a frame (eg. a colour waterfall). Some panels
+  // show it right away, and keep the rows drawn this way out of their own buffer until the next wipe().
+  virtual bool hasColor() { return false; }
+  virtual void drawRgbRowNative(int x, int y, const uint16_t* rgb, int w) { }
   // the height of a line of text at size 1, in UI pixels (for screens that pack text tightly)
   virtual int textLineHeight() { return 12; }
 
