@@ -12,7 +12,7 @@
 #endif
 
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.17.1+sp1"   // +sp: the spectrum page build (not a dash: the splash screen cuts there)
+#define FIRMWARE_VERSION "v1.17.1+sp2"   // +sp: the spectrum page build (not a dash: the splash screen cuts there)
 #endif
 
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
