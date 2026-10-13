@@ -21,6 +21,11 @@ class SX126xSpectrumScanner {
     REG_RESULT = 0x0400,        // RADIO_BUF
     REG_VERSION = 0x0320,       // ROM version string, 16 bytes
     REG_VERSION_TAG = 0x032E,   // last char of the version string, set by the plugin's init
+    // Bit 0 turns the AGC off: the gain stays at its maximum. With the AGC on, the gain steps down from ~-85 dBm in
+    // the channel and back up ~5 RSSI updates after the signal is gone, and every step holds the RSSI register
+    // for ~6 more updates: a sweep then shows a strong signal with a shelf of ~10 points after it. Kept until a
+    // reset (found on hardware, sxplug docs/measurements.md)
+    REG_AGC_OFF = 0x08A7,
     // In GFSK RX a packet (or noise passing for one) is written to the data buffer, which also holds the
     // results: fixed length 1, at the very end of the buffer, keeps it out of the way
     RX_BASE = 0xFF,
@@ -116,6 +121,9 @@ public:
     // doesn't set it back, unlike startReceive(): without this the sweep would run with the LNA path off
     _radio->mod->setRfSwitchState(Module::MODE_RX);
     err = _radio->setRx(RADIOLIB_SX126X_RX_TIMEOUT_INF);
+    if (err != RADIOLIB_ERR_NONE) return err;
+    uint8_t agc_off = 0x01;   // after the calibration in setFrequency(), in case it touches the gain settings
+    err = _radio->writeRegister(REG_AGC_OFF, &agc_off, 1);
     if (err != RADIOLIB_ERR_NONE) return err;
 
     // poll the RSSI register ~8 times per update (a poll costs ~0.6us, a delay loop 0.125us: 2 cycles
