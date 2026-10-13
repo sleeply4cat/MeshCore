@@ -11,7 +11,9 @@
 //
 // The RSSI register updates every ~1.6/RBW ms (RBW in kHz), and a point costs ~1 update: 250 points take
 // ~56ms at RBW 7.3kHz, ~21ms at 19.5kHz, ~5ms at 78kHz.
-// The plugin only lives in the radio's RAM, so a hardware reset (eg. a fresh begin()) removes it.
+// The plugin only lives in the radio's RAM: a reset or a sleep removes it. Many boards don't wire the radio's
+// NRESET (P_LORA_RESET = RADIOLIB_NC: Heltec V3, Wireless Paper, ...), so RadioLib's begin() can't reset it there;
+// begin() and end() reset it with a sleep instead.
 // While active, the radio is in GFSK RX and unusable for LoRa traffic.
 class SX126xSpectrumScanner {
   enum {
@@ -29,6 +31,14 @@ class SX126xSpectrumScanner {
   uint16_t _num_points;
   bool _active;
   SPISettings _saved_spi;
+
+  // like a pulse on NRESET, wired or not: a cold sleep keeps nothing, and the chip boots again when woken (the
+  // plugin is gone and '2' is back at the end of the version string)
+  void resetChip() {
+    _radio->standby();
+    _radio->sleep(false);
+    _radio->standby(RADIOLIB_SX126X_STANDBY_RC, true);   // wakes it, then waits for the boot (BUSY)
+  }
 
   static float pickRxBw(float khz) {
     static const float bws[] = { 4.8, 5.8, 7.3, 9.7, 11.7, 14.6, 19.5, 23.4, 29.3, 39.0, 46.9, 58.6,
@@ -51,13 +61,14 @@ public:
   // resets the radio into GFSK and loads the plugin
   int16_t begin(float freq_mhz, float tcxo, bool use_ldo) {
     if (_radio == NULL) return RADIOLIB_ERR_UNSUPPORTED;
+    resetChip();   // a plugin of an earlier run may still be there, eg. after a restart of the MCU alone
     int16_t err = _radio->beginFSK(freq_mhz, 4.8, 5.0, 234.3, 0, 16, tcxo, use_ldo);
     if (err == RADIOLIB_ERR_SPI_CMD_FAILED || err == RADIOLIB_ERR_SPI_CMD_INVALID) {
       err = _radio->beginFSK(freq_mhz, 4.8, 5.0, 234.3, 0, 16, 0.0f, use_ldo);   // same TCXO fallback as std_init()
     }
     if (err != RADIOLIB_ERR_NONE) return err;
 
-    char ver[16];   // after the reset in beginFSK(), so the plugin's tag isn't there yet
+    char ver[16];   // after the reset, so the plugin's tag isn't there yet
     err = _radio->readRegister(REG_VERSION, (uint8_t*) ver, sizeof(ver));
     if (err != RADIOLIB_ERR_NONE) return err;
     if (memcmp(ver, "SX1261 V2D 2D02", 15) != 0) return RADIOLIB_ERR_UNSUPPORTED;
@@ -139,11 +150,11 @@ public:
     return err;
   }
 
+  // also after a begin() that failed half-way
   void end() {
-    if (_active) {
-      _radio->standby();
-      ((ArduinoHal*) _radio->mod->hal)->spiSettings = _saved_spi;
-    }
+    if (_radio == NULL) return;
+    resetChip();   // for the LoRa setup that comes next: no plugin left behind
+    if (_active) ((ArduinoHal*) _radio->mod->hal)->spiSettings = _saved_spi;
     _active = false;
   }
 };
