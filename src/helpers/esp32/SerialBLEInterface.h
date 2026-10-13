@@ -8,6 +8,13 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
+#ifndef BLE_MAX_CONNECTIONS
+  #define BLE_MAX_CONNECTIONS  1
+#endif
+// With BLE_MAX_CONNECTIONS > 1, another client (eg. a web page for the spectrum view) can connect next to the app:
+// advertising goes on while a connection is free, the app's connection is the one that writes to the UART, and
+// the UART's notifications go to it alone.
+
 class SerialBLEInterface : public BaseSerialInterface, BLESecurityCallbacks, BLEServerCallbacks, BLECharacteristicCallbacks {
   BLEServer *pServer;
   BLEService *pService;
@@ -47,6 +54,10 @@ protected:
   void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) override;
   void onMtuChanged(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override;
   void onDisconnect(BLEServer* pServer) override;
+#if BLE_MAX_CONNECTIONS > 1
+  void onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override;
+  int app_conn;   // connection id of the app (the UART's writer), -1 if none
+#endif
 
   // BLECharacteristicCallbacks methods
   void onWrite(BLECharacteristic* pCharacteristic, esp_ble_gatts_cb_param_t* param) override;
@@ -61,6 +72,9 @@ public:
     _isEnabled = false;
     _last_write = 0;
     last_conn_id = 0;
+  #if BLE_MAX_CONNECTIONS > 1
+    app_conn = -1;
+  #endif
     recv_queue = xQueueCreateStatic(
       FRAME_QUEUE_SIZE, sizeof(Frame), recv_queue_storage, &recv_queue_state
     );
@@ -81,6 +95,11 @@ public:
   bool isEnabled() const override { return _isEnabled; }
 
   bool isConnected() const override;
+
+  BLEServer* getServer() { return pServer; }   // for other services next to the UART (before enable())
+#if BLE_MAX_CONNECTIONS > 1
+  int appConnId() const { return app_conn; }
+#endif
 
   bool isWriteBusy() const override;
   size_t writeFrame(const uint8_t src[], size_t len) override;

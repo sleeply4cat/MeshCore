@@ -1,4 +1,7 @@
 #include "SerialBLEInterface.h"
+#if BLE_MAX_CONNECTIONS > 1
+  #include "BLEGattsHook.h"
+#endif
 #include "esp_mac.h"
 
 // See the following for generating UUIDs:
@@ -37,6 +40,9 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
   // Create the BLE Server
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(this);
+#if BLE_MAX_CONNECTIONS > 1
+  BLEGattsHook::add([](esp_gatts_cb_event_t, esp_gatt_if_t, esp_ble_gatts_cb_param_t*, void*) { }, NULL);   // for gattsIf()
+#endif
 
   // Create the BLE Service
   pService = pServer->createService(SERVICE_UUID);
@@ -77,7 +83,9 @@ bool SerialBLEInterface::onSecurityRequest() {
 void SerialBLEInterface::onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) {
   if (cmpl.success) {
     BLE_DEBUG_PRINTLN(" - SecurityCallback - Authentication Success");
-    deviceConnected = true;
+  #if BLE_MAX_CONNECTIONS == 1
+    deviceConnected = true;   // else when the connection first writes to the UART (onWrite())
+  #endif
   } else {
     BLE_DEBUG_PRINTLN(" - SecurityCallback - Authentication Failure*");
 
@@ -95,6 +103,9 @@ void SerialBLEInterface::onConnect(BLEServer* pServer) {
 void SerialBLEInterface::onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) {
   BLE_DEBUG_PRINTLN("onConnect(), conn_id=%d, mtu=%d", param->connect.conn_id, pServer->getPeerMTU(param->connect.conn_id));
   last_conn_id = param->connect.conn_id;
+#if BLE_MAX_CONNECTIONS > 1
+  if (pServer->getConnectedCount() < BLE_MAX_CONNECTIONS) adv_restart_time = millis() + ADVERT_RESTART_DELAY;
+#endif
 }
 
 void SerialBLEInterface::onMtuChanged(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) {
@@ -103,15 +114,34 @@ void SerialBLEInterface::onMtuChanged(BLEServer* pServer, esp_ble_gatts_cb_param
 
 void SerialBLEInterface::onDisconnect(BLEServer* pServer) {
   BLE_DEBUG_PRINTLN("onDisconnect()");
+#if BLE_MAX_CONNECTIONS == 1
   deviceConnected = false;
+#endif
   if (_isEnabled) {
     adv_restart_time = millis() + ADVERT_RESTART_DELAY;
   }
 }
 
+#if BLE_MAX_CONNECTIONS > 1
+void SerialBLEInterface::onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) {
+  if (param->disconnect.conn_id == app_conn) {   // the app's: another client may stay
+    app_conn = -1;
+    deviceConnected = false;
+  }
+}
+#endif
+
 // -------- BLECharacteristicCallbacks methods
 
 void SerialBLEInterface::onWrite(BLECharacteristic* pCharacteristic, esp_ble_gatts_cb_param_t* param) {
+#if BLE_MAX_CONNECTIONS > 1
+  if (app_conn < 0) {   // the first connection to use the UART is the app's
+    app_conn = param->write.conn_id;
+    deviceConnected = true;
+  } else if (param->write.conn_id != app_conn) {
+    return;
+  }
+#endif
   uint8_t* rxValue = pCharacteristic->getData();
   int len = pCharacteristic->getLength();
 
@@ -159,7 +189,12 @@ void SerialBLEInterface::disable() {
   BLE_DEBUG_PRINTLN("SerialBLEInterface::disable");
 
   pServer->getAdvertising()->stop();
+#if BLE_MAX_CONNECTIONS > 1
+  for (auto& peer : pServer->getPeerDevices(false)) pServer->disconnect(peer.first);
+  app_conn = -1;
+#else
   pServer->disconnect(last_conn_id);
+#endif
   pService->stop();
   oldDeviceConnected = deviceConnected = false;
   adv_restart_time = 0;
@@ -198,7 +233,14 @@ size_t SerialBLEInterface::checkRecvFrame(uint8_t dest[]) {
   ) {
     _last_write = millis();
     pTxCharacteristic->setValue(send_queue[0].buf, send_queue[0].len);
+  #if BLE_MAX_CONNECTIONS > 1
+    if (app_conn >= 0) {   // to the app only, not to the other clients
+      esp_ble_gatts_send_indicate(BLEGattsHook::gattsIf(), app_conn, pTxCharacteristic->getHandle(), send_queue[0].len,
+                                  send_queue[0].buf, false);
+    }
+  #else
     pTxCharacteristic->notify();
+  #endif
 
     BLE_DEBUG_PRINTLN("writeBytes: sz=%d, hdr=%d", (uint32_t)send_queue[0].len, (uint32_t) send_queue[0].buf[0]);
 
@@ -230,14 +272,16 @@ size_t SerialBLEInterface::checkRecvFrame(uint8_t dest[]) {
       BLE_DEBUG_PRINTLN("SerialBLEInterface -> connecting...");
       // connecting
       // do stuff here on connecting
+    #if BLE_MAX_CONNECTIONS == 1
       pServer->getAdvertising()->stop();
       adv_restart_time = 0;
+    #endif
     }
     oldDeviceConnected = deviceConnected;
   }
 
   if (adv_restart_time && millis() >= adv_restart_time) {
-    if (pServer->getConnectedCount() == 0) {
+    if (pServer->getConnectedCount() < BLE_MAX_CONNECTIONS) {
       BLE_DEBUG_PRINTLN("SerialBLEInterface -> re-starting advertising");
       pServer->getAdvertising()->start();  // re-Start advertising
     }

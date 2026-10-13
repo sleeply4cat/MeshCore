@@ -18,6 +18,9 @@ extern RADIO_CLASS radio;   // in every variant's target.cpp
 template <class R> static SX1262* spectrumRadio(R& r, std::true_type) { return &r; }
 template <class R> static SX1262* spectrumRadio(R&, std::false_type) { return NULL; }
 
+#if SPECTRUM_BLE && !defined(SPECTRUM_BLE_FRAME_MS)
+  #define SPECTRUM_BLE_FRAME_MS  50   // default interval of the frames for a stream client (it can change it)
+#endif
 #define SPECTRUM_POINTS      SX126xSpectrumScanner::MAX_POINTS   // at most; a sweep has as many points as the panel is wide
 #ifndef SPECTRUM_FRAME_MS
   #define SPECTRUM_FRAME_MS      50    // min time between drawing frames (the panel refresh overlaps it)
@@ -53,8 +56,32 @@ public:
   struct Host {
     virtual void spectrumAlert(const char* text, int duration_ms) = 0;
     virtual void spectrumExit() = 0;   // leave the view: the host calls stop() on the way
+    virtual void spectrumOpen() { }    // a stream client asks for the view: the host opens it (start())
   };
 
+  // A client of the sweeps beside the display, eg. a BLE service for a web page (SPECTRUM_BLE): frames go to it
+  // from the scan task, and its requests are served from streamLoop(). All values little-endian.
+  //  info: u8 version (1), u8 state (STATE_*), u8 span index, u8 points, u32 first point (Hz), u32 step (Hz),
+  //        u32 RBW (Hz), u32 centre (Hz), u32 node frequency (Hz), u32 node bandwidth (Hz), i16 radio error,
+  //        u8 config generation, u8 flags (FLAG_*), u16 frame interval (ms, 0: every sweep), u8 AGG_*, u8 0
+  //  frames: each point aggregated over the sweeps since the previous frame (AGG_*), -2 * dBm (255: no data)
+  //  requests: CTRL_START [span], CTRL_STOP, CTRL_SPAN span, CTRL_CENTRE Hz (0: follow the node's channel),
+  //        CTRL_INTERVAL ms (0: every sweep, else 10..2000), CTRL_AGG AGG_*
+  struct Stream {
+    enum { STATE_OFF = 0, STATE_STARTING = 1, STATE_RUNNING = 2 };
+    enum { FLAG_FOLLOW = 1 };
+    enum { CTRL_START = 1, CTRL_STOP = 2, CTRL_SPAN = 3, CTRL_CENTRE = 4, CTRL_INTERVAL = 5, CTRL_AGG = 6 };
+    enum { AGG_MAX = 0, AGG_MEAN = 1, AGG_LAST = 2 };
+    enum { INFO_LEN = 36 };
+    struct Request {
+      uint8_t op;
+      uint32_t arg;   // 0xFFFFFFFF: none
+    };
+    virtual bool hasSubscribers() = 0;                          // anyone to send frames to
+    virtual void setInfo(const uint8_t info[INFO_LEN]) = 0;     // the state: sent on change
+    virtual bool sendFrame(uint8_t gen, const uint8_t* levels, uint8_t n) = 0;   // never waits for the link
+    virtual bool takeRequest(Request& req) = 0;
+  };
   enum Action { ZOOM_OUT, ZOOM_IN, EXIT };
 
 private:
@@ -65,6 +92,8 @@ private:
   bool _pending_start, _need_wipe;
   uint8_t _span_idx;
   float _freq, _bw;      // the mesh channel shown; follows the node's prefs (render())
+  float _center;         // centre of the view: the mesh channel, unless a stream client set another
+  bool _follow;          // _center follows _freq
 
   // shared with the scan task
   TaskHandle_t _scan_task;
@@ -117,8 +146,61 @@ private:
     static const float steps[] = { 3.0f, 2.0f, 2.0f, 1.5f };
     return steps[idx % 4];
   }
-  float edgeMHz(uint8_t idx) const { return _freq - spanMHz(idx) / 2; }
+  float edgeMHz(uint8_t idx) const { return _center - spanMHz(idx) / 2; }
 
+#if SPECTRUM_BLE
+  // scan task only: the sweeps since the last stream frame, aggregated as the client asks (AGG_*)
+  Stream* _stream = NULL;
+  uint8_t _str_min[SPECTRUM_POINTS];          // strongest level (-2 * dBm, as the radio's)
+  float _str_sum[SPECTRUM_POINTS];            // sum of linear power
+  float _str_lin[256];                        // level -> linear power
+  uint16_t _str_count;
+  uint8_t _str_agg_cur;
+  uint32_t _str_at;
+  volatile uint16_t _str_ms = SPECTRUM_BLE_FRAME_MS;   // frame interval, 0: every sweep
+  volatile uint8_t _str_agg = Stream::AGG_MAX;
+
+  void streamReset() {
+    memset(_str_min, 0xFF, sizeof(_str_min));
+    memset(_str_sum, 0, sizeof(_str_sum));
+    _str_count = 0;
+  }
+
+  // from the scan task: not held up by the display, whose refresh may block the UI loop
+  void streamSweep(const uint8_t* level, int n, uint8_t gen) {
+    uint8_t agg = _str_agg;
+    if (agg != _str_agg_cur) {
+      _str_agg_cur = agg;
+      streamReset();
+    }
+    if (agg == Stream::AGG_MAX) {
+      for (int i = 0; i < n; i++) if (level[i] < _str_min[i]) _str_min[i] = level[i];
+    } else if (agg == Stream::AGG_MEAN) {
+      for (int i = 0; i < n; i++) _str_sum[i] += _str_lin[level[i]];
+    }
+    _str_count++;
+    uint32_t now = millis();
+    uint16_t ms = _str_ms;
+    if (ms) {
+      if (now - _str_at < ms) return;
+      _str_at = now - _str_at < 2u * ms ? _str_at + ms : now;   // on a steady beat
+    }
+    if (_stream->hasSubscribers()) {
+      const uint8_t* out = level;   // AGG_LAST
+      if (agg == Stream::AGG_MAX) {
+        out = _str_min;
+      } else if (agg == Stream::AGG_MEAN) {
+        for (int i = 0; i < n; i++) {
+          int v = (int)(-20.0f * log10f(_str_sum[i] / _str_count) + 0.5f);
+          _str_min[i] = v < 0 ? 0 : (v > 254 ? 254 : v);
+        }
+        out = _str_min;
+      }
+      _stream->sendFrame(gen, out, n);
+    }
+    streamReset();
+  }
+#endif
 
   // --- scan task ---
 
@@ -129,6 +211,9 @@ private:
     float step = spanMHz(idx) / n;
     _scanner.setSweep(edgeMHz(idx) + step / 2, step, n, step * 1000.0f * spanRbwSteps(idx));
     for (int i = 0; i < SPECTRUM_POINTS; i++) _cur[i] = _fmax[i] = SPECTRUM_NO_SIGNAL;
+  #if SPECTRUM_BLE
+    streamReset();
+  #endif
   }
 
   void scanLoop() {
@@ -154,6 +239,9 @@ private:
         if (a > _fmax[i]) _fmax[i] = a;
       }
       xTaskResumeAll();
+    #if SPECTRUM_BLE
+      if (_stream) streamSweep(level, n, gen);
+    #endif
     }
     _task_running = false;
     vTaskDelete(NULL);
@@ -412,9 +500,12 @@ private:
     }
     // mesh channel: dotted centre line, and its bandwidth on the baseline
     int cx = freqToX(_freq);
-    for (int y = _graph_y; y < bottom; y += 3) d.fillRectNative(cx, y, 1, 1);
     int half_bw = (int)(_bw / 2000.0f / spanMHz(_span_idx) * _w);
-    d.fillRectNative(cx - half_bw, bottom + 1, half_bw * 2 + 1, 2);
+    if (cx >= 0 && cx < _w) {   // off the view when a stream client moved its centre
+      for (int y = _graph_y; y < bottom; y += 3) d.fillRectNative(cx, y, 1, 1);
+    }
+    int bl = cx - half_bw < 0 ? 0 : cx - half_bw, br = cx + half_bw >= _w ? _w - 1 : cx + half_bw;
+    if (br >= bl) d.fillRectNative(bl, bottom + 1, br - bl + 1, 2);
   }
 
   void renderWaterfall(DisplayDriver& d) {
@@ -452,7 +543,7 @@ private:
     const int gap = 6;
     int wr = d.getTextWidth(right);
     if (d.getTextWidth(left) + gap + wr > d.width()) {
-      sprintf(left, span < 1 ? "%.3f %.1fM" : "%.3f %.0fM", _freq, span);
+      sprintf(left, span < 1 ? "%.3f %.1fM" : "%.3f %.0fM", _center, span);
     }
     if (d.getTextWidth(left) + gap + wr <= d.width()) {   // else only the error: it matters more
       d.setCursor(0, 0);
@@ -486,9 +577,13 @@ private:
 public:
   SpectrumView(Host* host, NodePrefs* prefs)
       : _host(host), _prefs(prefs), _display(NULL), _scanner(spectrumRadio(radio, std::is_base_of<SX1262, RADIO_CLASS>{})), _pending_start(false), _need_wipe(false), _span_idx(1),
-        _run(false), _task_running(false), _span_req(1), _cfg_gen(0), _cfg_applied(0), _wf_mem(NULL), _color(false), _wf(NULL), _wf_rgb(NULL), _wf_err(NULL), _wf_err_next(NULL) {
+        _center(0), _follow(true), _run(false), _task_running(false), _span_req(1), _cfg_gen(0), _cfg_applied(0), _wf_mem(NULL), _color(false), _wf(NULL), _wf_rgb(NULL), _wf_err(NULL), _wf_err_next(NULL) {
     _points = 0;   // set from the panel's width on the first start()
     buildPalette();
+  #if SPECTRUM_BLE
+    _str_agg_cur = Stream::AGG_MAX;
+    for (int l = 0; l < 256; l++) _str_lin[l] = powf(10.0f, -l / 20.0f);   // -2 * dBm -> mW
+  #endif
   }
 
   bool ownsRadio() const { return _scanner.isActive(); }
@@ -501,11 +596,13 @@ public:
     }
     _freq = _prefs->freq;
     _bw = _prefs->bw;
+    if (_follow) _center = _freq;
+    _span_req = _span_idx;
     _sweep_err = RADIOLIB_ERR_NONE;
     _frame_noise = -115;
     _floor_dbm = -125;
     _peak = _hdr_peak = -1;
-    _peak_mhz = _freq;
+    _peak_mhz = _center;
     for (int i = 0; i < SPECTRUM_POINTS; i++) _cur[i] = _fmax[i] = SPECTRUM_NO_SIGNAL;
     clearHistory();
     _display = &d;
@@ -570,8 +667,11 @@ public:
     if (_prefs->freq != _freq || _prefs->bw != _bw) {   // the node's channel changed (eg. from the app): follow it,
       _freq = _prefs->freq;                               // without a wipe of the panel
       _bw = _prefs->bw;
-      _peak_mhz = _freq;
-      changeSpan(_span_idx, false);
+      if (_follow) {
+        _center = _freq;
+        _peak_mhz = _freq;
+        changeSpan(_span_idx, false);
+      }
     }
     if (_need_wipe) {   // start from a clean panel: on entry and when the span changes
       d.wipe();
@@ -625,4 +725,96 @@ public:
     }
     return true;
   }
+
+#if SPECTRUM_BLE
+  void setStream(Stream* stream) { _stream = stream; }
+
+  // From the UI loop, whatever the screen: the stream client's requests, and the state it sees
+  void streamLoop() {
+    if (_stream == NULL) return;
+    Stream::Request req;
+    while (_stream->takeRequest(req)) {
+      bool has_arg = req.arg != 0xFFFFFFFF;
+      switch (req.op) {
+        case Stream::CTRL_START:
+          if (has_arg) setSpan(req.arg);
+          if (!isOpen()) _host->spectrumOpen();
+          break;
+        case Stream::CTRL_STOP:
+          if (isOpen()) {
+            _host->spectrumAlert("Mesh radio resumed", 1000);
+            _host->spectrumExit();
+          }
+          break;
+        case Stream::CTRL_SPAN:
+          if (has_arg) setSpan(req.arg);
+          break;
+        case Stream::CTRL_INTERVAL:
+          if (has_arg && ((req.arg & 0xFFFF) == 0 || ((req.arg & 0xFFFF) >= 10 && (req.arg & 0xFFFF) <= 2000))) {
+            _str_ms = req.arg & 0xFFFF;
+          }
+          break;
+        case Stream::CTRL_AGG:
+          if (has_arg && req.arg <= Stream::AGG_LAST) _str_agg = req.arg;
+          break;
+        case Stream::CTRL_CENTRE:
+          if (!has_arg) break;
+          if (req.arg == 0) {
+            _follow = true;
+            _center = _freq;
+          } else if (req.arg >= 150000000 && req.arg <= 960000000) {
+            _follow = false;
+            _center = req.arg / 1e6f;
+          } else {
+            break;
+          }
+          if (isOpen()) {
+            _peak_mhz = _center;
+            changeSpan(_span_idx, false);
+          }
+          break;
+      }
+    }
+    publishInfo();
+  }
+
+private:
+  void setSpan(uint32_t idx) {
+    if (idx > 3) return;
+    if (isOpen()) {
+      if (idx != _span_idx) changeSpan(idx);
+    } else {
+      _span_idx = idx;
+    }
+  }
+
+  static void put32(uint8_t* p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+
+  void publishInfo() {
+    uint8_t info[Stream::INFO_LEN];
+    memset(info, 0, sizeof(info));
+    float node = _prefs->freq, center = !isOpen() && _follow ? node : _center;
+    int n = _points ? _points : SPECTRUM_POINTS;   // the panel's width, once known
+    double step = spanMHz(_span_idx) / n;
+    info[0] = 1;
+    info[1] = !isOpen() ? Stream::STATE_OFF : (_scanner.isActive() ? Stream::STATE_RUNNING : Stream::STATE_STARTING);
+    info[2] = _span_idx;
+    info[3] = n;
+    put32(&info[4], (uint32_t)((center - spanMHz(_span_idx) / 2 + step / 2) * 1e6 + 0.5));
+    put32(&info[8], (uint32_t)(step * 1e6 + 0.5));
+    put32(&info[12], (uint32_t)(SX126xSpectrumScanner::pickRxBw(step * 1000.0 * spanRbwSteps(_span_idx)) * 1000 + 0.5f));
+    put32(&info[16], (uint32_t)(center * 1e6 + 0.5));
+    put32(&info[20], (uint32_t)(node * 1e6 + 0.5));
+    put32(&info[24], (uint32_t)(_prefs->bw * 1000 + 0.5f));
+    int16_t err = _sweep_err;
+    info[28] = err;
+    info[29] = err >> 8;
+    info[30] = _cfg_gen;
+    info[31] = _follow ? Stream::FLAG_FOLLOW : 0;
+    info[32] = _str_ms;
+    info[33] = _str_ms >> 8;
+    info[34] = _str_agg;
+    _stream->setInfo(info);
+  }
+#endif
 };
