@@ -183,6 +183,14 @@ void ST7789Display::drawXbm(int x, int y, const uint8_t* bits, int w, int h) {
   }
 }
 
+int ST7789Display::toNativeY(int y) {
+  return y*SCALE_Y + Y_OFFSET;
+}
+
+void ST7789Display::fillRectNative(int x, int y, int w, int h) {
+  display.fillRect(x, y, w, h);
+}
+
 uint16_t ST7789Display::getTextWidth(const char* str) {
   return display.getStringWidth(str) / SCALE_X;
 }

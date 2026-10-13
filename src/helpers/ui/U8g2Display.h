@@ -109,6 +109,7 @@ public:
     _u8g2.drawXBM(x, y, w, h, bits);
   }
 
+  int textLineHeight() override { return 8; }
   uint16_t getTextWidth(const char* str) override {
     return _u8g2.getStrWidth(str);
   }

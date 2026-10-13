@@ -112,6 +112,18 @@ void ST7789LCDDisplay::print(const char* str) {
   display.print(str);
 }
 
+int ST7789LCDDisplay::textLineHeight() {
+  return (int)(8 * (int)DISPLAY_SCALE_X / DISPLAY_SCALE_Y) + 1;   // the 8px font at text size 1 * DISPLAY_SCALE_X
+}
+
+int ST7789LCDDisplay::toNativeY(int y) {
+  return y * DISPLAY_SCALE_Y;
+}
+
+void ST7789LCDDisplay::fillRectNative(int x, int y, int w, int h) {
+  display.fillRect(x, y, w, h, _color);
+}
+
 void ST7789LCDDisplay::fillRect(int x, int y, int w, int h) {
   display.fillRect(x * DISPLAY_SCALE_X, y * DISPLAY_SCALE_Y, w * DISPLAY_SCALE_X, h * DISPLAY_SCALE_Y, _color);
 }

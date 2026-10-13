@@ -12,7 +12,7 @@
 #endif
 
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.17.1"
+#define FIRMWARE_VERSION "v1.17.1+sp1"   // +sp: the spectrum page build (not a dash: the splash screen cuts there)
 #endif
 
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
@@ -207,6 +207,7 @@ private:
   // helpers, short-cuts
   void saveChannels() { _store->saveChannels(this); }
   void saveContacts();
+  bool isRadioBorrowed() const { return _ui != NULL && _ui->isRadioBorrowed(); }
 
   DataStore* _store;
   NodePrefs _prefs;
