@@ -595,6 +595,14 @@ uint16_t ST7735Display::getTextWidth(const char* str) {
   return sprite->textWidth(str) / SCALE_X;
 }
 
+void ST7735Display::drawRgbRowNative(int x, int y, const uint16_t* rgb, int w) {
+  if (y < 0 || y >= 80) return;
+  if (x < 0) { rgb -= x; w += x; x = 0; }
+  if (x + w > 160) w = 160 - x;
+  uint16_t* row = (uint16_t *) sprite->getPointer() + y * 160 + x;
+  for (int i = 0; i < w; i++) row[i] = rgb[i] >> 8 | rgb[i] << 8;   // the canvas holds them as sent: high byte first
+}
+
 void ST7735Display::endFrame() {
   // blit the canvas buffer to LCD
   set_CS(LOW);

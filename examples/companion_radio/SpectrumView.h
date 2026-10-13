@@ -39,6 +39,9 @@ template <class R> static SX1262* spectrumRadio(R&, std::false_type) { return NU
 #define SPECTRUM_RANGE_DB    50      // vertical range of the graph
 #define SPECTRUM_WF_LO       3       // waterfall: dB above noise where the grey scale starts
 #define SPECTRUM_WF_RANGE    32      //            and its span in dB, up to solid black
+#define SPECTRUM_WFC_LO      -4      // colour waterfall: dB above noise where the palette starts (the noise shows)
+#define SPECTRUM_WFC_RANGE   44      //                   and its span in dB, up to white
+#define SPECTRUM_PALETTE     64      //                   colours
 
 // SDR-like view of the band around the mesh frequency: live spectrum with decaying peak-hold, plus a waterfall.
 // Sweeps run continuously in their own RTOS task, so they don't stop while the display is drawn or refreshed;
@@ -77,7 +80,10 @@ private:
   uint16_t _points;      // per sweep: one per pixel column, up to SPECTRUM_POINTS (set before the scan task starts)
   uint32_t _wf_pushed;
   uint8_t* _wf_mem;      // one allocation for all the buffers below
-  uint8_t* _wf;          // waterfall ring buffer of dithered 1-bit rows
+  bool _color;           // colour waterfall (colour panels with the memory for it), else dithered 1-bit
+  uint8_t* _wf;          // waterfall ring buffer of rows: dithered 1-bit, or a palette index per pixel (colour)
+  uint16_t* _wf_rgb;     // colour: a row being drawn, RGB565
+  uint16_t _palette[SPECTRUM_PALETTE];
   int16_t* _wf_err;      // error diffusion: carried into the next row, and being collected for it (2 x (w + 2))
   int16_t* _wf_err_next;
   uint8_t* _px_idx;      // per pixel column: left point index and weight of the right one, for interpolation
@@ -204,15 +210,23 @@ private:
       _wf_y = h;
     }
 
-    _wf_stride = (_w + 7) / 8;
-
-    // int16 buffers first, for alignment
-    uint8_t* mem = (uint8_t*) malloc(2 * (_w + 2) * sizeof(int16_t) + _wf_stride * _wf_rows + _w * 2);
-    if (mem == NULL) return false;
+    // 16-bit buffers first, for alignment: a colour row to draw, or the dither's error rows
+    _color = d.hasColor();
+    uint8_t* mem;
+    int words;
+    for (;;) {
+      _wf_stride = _color ? _w : (_w + 7) / 8;
+      words = _color ? _w : 2 * (_w + 2);
+      mem = (uint8_t*) malloc(words * sizeof(int16_t) + _wf_stride * _wf_rows + _w * 2);
+      if (mem != NULL) break;
+      if (!_color) return false;
+      _color = false;   // not enough memory for colour: a dithered waterfall then
+    }
     _wf_mem = mem;
-    _wf_err = (int16_t*) mem;
-    _wf_err_next = _wf_err + _w + 2;
-    _wf = mem + 2 * (_w + 2) * sizeof(int16_t);
+    _wf_rgb = _color ? (uint16_t*) mem : NULL;
+    _wf_err = _color ? NULL : (int16_t*) mem;
+    _wf_err_next = _color ? NULL : _wf_err + _w + 2;
+    _wf = mem + words * sizeof(int16_t);
     _px_idx = _wf + _wf_stride * _wf_rows;
     _px_frac = _px_idx + _w;
     buildPixelMap();
@@ -234,6 +248,7 @@ private:
     free(_wf_mem);   // _wf_err and _wf_err_next swap places, so they can't be freed
     _wf_mem = _wf = _px_idx = _px_frac = NULL;
     _wf_err = _wf_err_next = NULL;
+    _wf_rgb = NULL;
   }
 
   void clearHistory() {
@@ -242,7 +257,7 @@ private:
       for (int i = 0; i < SPECTRUM_POINTS; i++) _recent[f][i] = SPECTRUM_NO_SIGNAL;
     _recent_head = 0;
     memset(_wf, 0, _wf_stride * _wf_rows);
-    memset(_wf_err, 0, 2 * (_w + 2) * sizeof(int16_t));
+    if (!_color) memset(_wf_err, 0, 2 * (_w + 2) * sizeof(int16_t));
     _wf_head = _wf_count = 0;
     _wf_pushed = 0;
     _hold_frac = 0;
@@ -298,7 +313,8 @@ private:
     if (_wf_rows == 0 || now - _wf_row_at < _wf_row_ms) return;
     _wf_row_at = (now - _wf_row_at < 2u * _wf_row_ms) ? _wf_row_at + _wf_row_ms : now;   // keep the cadence
     // the row is the max over its frames, so its noise sits higher still: the grey scale follows its own median
-    ditherRow(&_wf[_wf_head * _wf_stride], _wf_acc, medianDbm(_wf_acc));
+    if (_color) colorRow(&_wf[_wf_head * _wf_stride], _wf_acc, medianDbm(_wf_acc));
+    else ditherRow(&_wf[_wf_head * _wf_stride], _wf_acc, medianDbm(_wf_acc));
     for (int i = 0; i < n; i++) _wf_acc[i] = SPECTRUM_NO_SIGNAL;
     _wf_head = (_wf_head + 1) % _wf_rows;
     if (_wf_count < _wf_rows) _wf_count++;
@@ -332,6 +348,30 @@ private:
       next[x + dir] += e / 16;
     }
     int16_t* t = _wf_err; _wf_err = _wf_err_next; _wf_err_next = t;
+  }
+
+  // colour panels: a palette index per pixel, no dither needed
+  void colorRow(uint8_t* idx, const int16_t* row, int noise) {
+    for (int x = 0; x < _w; x++) {
+      int db = interp(row, x) - noise - SPECTRUM_WFC_LO;
+      idx[x] = db <= 0 ? 0 : (db >= SPECTRUM_WFC_RANGE ? SPECTRUM_PALETTE - 1 : db * (SPECTRUM_PALETTE - 1) / SPECTRUM_WFC_RANGE);
+    }
+  }
+
+  // the usual SDR waterfall colours: black, blue, cyan, yellow, red, white
+  void buildPalette() {
+    static const uint8_t stops[][4] = {   // palette index, R, G, B
+      { 0, 0, 0, 0 }, { 10, 0, 0, 96 }, { 20, 0, 48, 224 }, { 30, 0, 192, 224 }, { 40, 240, 224, 0 },
+      { 52, 240, 32, 0 }, { SPECTRUM_PALETTE - 1, 255, 255, 255 } };
+    for (int s = 0; s + 1 < (int)(sizeof(stops) / sizeof(stops[0])); s++) {
+      const uint8_t* a = stops[s];
+      const uint8_t* b = stops[s + 1];
+      for (int i = a[0]; i <= b[0]; i++) {
+        int f = (i - a[0]) * 256 / (b[0] - a[0]);
+        int r = a[1] + (b[1] - a[1]) * f / 256, g = a[2] + (b[2] - a[2]) * f / 256, bl = a[3] + (b[3] - a[3]) * f / 256;
+        _palette[i] = (r >> 3) << 11 | (g >> 2) << 5 | bl >> 3;
+      }
+    }
   }
 
   int interp(const int16_t* v, int x) const {
@@ -378,6 +418,14 @@ private:
   }
 
   void renderWaterfall(DisplayDriver& d) {
+    if (_color) {
+      for (int r = 0; r < _wf_count; r++) {   // newest on top
+        const uint8_t* idx = &_wf[((_wf_head - 1 - r + _wf_rows) % _wf_rows) * _wf_stride];
+        for (int x = 0; x < _w; x++) _wf_rgb[x] = _palette[idx[x]];
+        d.drawRgbRowNative(0, _wf_y + r, _wf_rgb, _w);
+      }
+      return;
+    }
     for (int r = 0; r < _wf_count; r++) {   // newest on top
       const uint8_t* bits = &_wf[((_wf_head - 1 - r + _wf_rows) % _wf_rows) * _wf_stride];
       int y = _wf_y + r;
@@ -438,8 +486,9 @@ private:
 public:
   SpectrumView(Host* host, NodePrefs* prefs)
       : _host(host), _prefs(prefs), _display(NULL), _scanner(spectrumRadio(radio, std::is_base_of<SX1262, RADIO_CLASS>{})), _pending_start(false), _need_wipe(false), _span_idx(1),
-        _run(false), _task_running(false), _span_req(1), _cfg_gen(0), _cfg_applied(0), _wf_mem(NULL), _wf(NULL), _wf_err(NULL), _wf_err_next(NULL) {
+        _run(false), _task_running(false), _span_req(1), _cfg_gen(0), _cfg_applied(0), _wf_mem(NULL), _color(false), _wf(NULL), _wf_rgb(NULL), _wf_err(NULL), _wf_err_next(NULL) {
     _points = 0;   // set from the panel's width on the first start()
+    buildPalette();
   }
 
   bool ownsRadio() const { return _scanner.isActive(); }

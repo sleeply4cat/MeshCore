@@ -529,6 +529,23 @@ void NV3001BDisplay::fillRectNative(int x, int y, int w, int h) {
   fillPhysicalRect(x, y, w, h);
 }
 
+void NV3001BDisplay::drawRgbRowNative(int x, int y, const uint16_t* rgb, int w) {
+  if (!is_on || y < 0 || y >= NV3001B_SCREEN_HEIGHT) return;
+  if (x < 0) { rgb -= x; w += x; x = 0; }
+  if (x + w > NV3001B_SCREEN_WIDTH) w = NV3001B_SCREEN_WIDTH - x;
+  if (w <= 0) return;
+  setAddrWindow(x, y, w, 1);
+  spi.beginTransaction(SPISettings(SPI_FREQUENCY, MSBFIRST, SPI_MODE0));
+  digitalWrite(PIN_TFT_DC, HIGH);
+  digitalWrite(PIN_TFT_CS, LOW);
+  for (int i = 0; i < w; i++) {
+    spi.transfer(rgb[i] >> 8);
+    spi.transfer(rgb[i] & 0xff);
+  }
+  digitalWrite(PIN_TFT_CS, HIGH);
+  spi.endTransaction();
+}
+
 void NV3001BDisplay::fillRect(int x, int y, int w, int h) {
   fillPhysicalRect(scaleX(x), scaleY(y), scaleWidth(x, w), scaleHeight(y, h));
 }

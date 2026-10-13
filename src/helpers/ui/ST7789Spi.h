@@ -106,6 +106,9 @@ class ST7789Spi : public OLEDDisplay {
       SPISettings 		    _spiSettings;
       uint16_t            _RGB=0xFFFF;
       uint8_t             _buffheight;
+      uint32_t           *_direct = NULL;   // per pixel row: a hash of what pushRow() sent there, 0 if nothing
+
+      bool isDirect(uint16_t row) { return _direct != NULL && row < displayHeight && _direct[row] != 0; }
   public:
     /* pass _cs as -1 to indicate "do not use CS pin", for cases where it is hard wired low */
     ST7789Spi(SPIClass *spiClass,uint8_t _rst, uint8_t _dc, uint8_t _cs, OLEDDISPLAY_GEOMETRY g = GEOMETRY_RAWMODE,uint16_t width=240,uint16_t height=135,int mosi=-1,int miso=-1,int clk=-1) {
@@ -190,6 +193,7 @@ class ST7789Spi : public OLEDDisplay {
           {
             for(int temp = 0; temp<8;temp++)
             {
+              if (isDirect(y*8+temp)) continue;   // pushRow()'s
               //setAddrWindow(minBoundX,y*8+temp,maxBoundX-minBoundX+1,1);
               setAddrWindow(minBoundX,y*8+temp,maxBoundX-minBoundX+1,1);
               //setAddrWindow(y*8+temp,minBoundX,1,maxBoundX-minBoundX+1);
@@ -218,6 +222,7 @@ class ST7789Spi : public OLEDDisplay {
           {
             for(int temp = 0; temp<8;temp++)
             {
+              if (isDirect(y*8+temp)) continue;   // pushRow()'s
               //setAddrWindow(minBoundX,y*8+temp,maxBoundX-minBoundX+1,1);
               //setAddrWindow(minBoundX,y*8+temp,maxBoundX-minBoundX+1,1);
               setAddrWindow(y*8+temp,0,1,displayWidth);
@@ -239,6 +244,48 @@ class ST7789Spi : public OLEDDisplay {
 	  set_CS(HIGH);
 
      #endif
+    }
+
+    // A row of RGB565 pixels straight to the panel, past the 1-bit buffer (which has one colour for all): display()
+    // leaves that pixel row alone from then on, until wipe(). A row sent again unchanged isn't sent.
+    void pushRow(int16_t x, int16_t y, const uint16_t* rgb, int16_t w) {
+      if (y < 0 || y >= displayHeight) return;
+      if (x < 0) { rgb -= x; w += x; x = 0; }
+      if (x + w > displayWidth) w = displayWidth - x;
+      if (w <= 0) return;
+      if (_direct == NULL) {
+        _direct = (uint32_t *)calloc(displayHeight, sizeof(uint32_t));
+        if (_direct == NULL) return;
+      }
+      uint32_t hash = 2166136261u ^ (x << 16 | w);   // FNV-1a
+      for (int16_t i = 0; i < w; i++) hash = (hash ^ rgb[i]) * 16777619u;
+      if (hash == 0) hash = 1;
+      if (_direct[y] == hash) return;
+      _direct[y] = hash;
+      uint16_t *pixbuf = (uint16_t *)rtos_malloc(2 * w);
+      if (pixbuf == NULL) return;
+      for (int16_t i = 0; i < w; i++) pixbuf[i] = rgb[i] >> 8 | rgb[i] << 8;   // sent as bytes: high first
+      set_CS(LOW);
+      _spi->beginTransaction(_spiSettings);
+      setAddrWindow(x, y, w, 1);
+#ifdef ESP_PLATFORM
+      _spi->transferBytes((uint8_t *)pixbuf, NULL, 2 * w);
+#else
+      _spi->transfer(pixbuf, NULL, 2 * w);
+#endif
+      _spi->endTransaction();
+      set_CS(HIGH);
+      rtos_free(pixbuf);
+    }
+
+    // clears the panel right away, pushRow()'s rows too, and hands them back to display()
+    void wipe() {
+      if (_direct) memset(_direct, 0, displayHeight * sizeof(uint32_t));
+      clear();
+    #ifdef OLEDDISPLAY_DOUBLE_BUFFER
+      memset(buffer_back, 0xFF, displayBufferSize);   // all of it differs: display() sends all of it
+    #endif
+      display();
     }
 
  virtual void resetOrientation() {
