@@ -37,6 +37,20 @@ public:
   virtual void drawRect(int x, int y, int w, int h) = 0;
   virtual void drawXbm(int x, int y, const uint8_t* bits, int w, int h) = 0;
   virtual uint16_t getTextWidth(const char* str) = 0;
+
+  // physical pixel access, for screens that need full resolution (eg. a spectrum waterfall)
+  virtual int nativeWidth() { return width(); }
+  virtual int nativeHeight() { return height(); }
+  virtual int toNativeY(int y) { return y; }
+  virtual void fillRectNative(int x, int y, int w, int h) { fillRect(x, y, w, h); }
+  // the height of a line of text at size 1, in UI pixels (for screens that pack text tightly)
+  virtual int textLineHeight() { return 12; }
+
+  // e-ink: switch to a fast, lower quality partial refresh, for live views. Returns false if unsupported.
+  virtual bool setFastRefresh(bool fast) { return false; }
+  // e-ink: wipe the panel to white right away (eg. to remove ghosting). Returns false if unsupported.
+  virtual bool wipe() { return false; }
+
   virtual void drawTextCentered(int mid_x, int y, const char* str) {   // helper method (override to optimise)
     int w = getTextWidth(str);
     setCursor(mid_x - w/2, y);

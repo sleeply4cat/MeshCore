@@ -42,6 +42,11 @@ public:
   void drawRect(int x, int y, int w, int h) override;
   void drawXbm(int x, int y, const uint8_t* bits, int w, int h) override;
   uint16_t getTextWidth(const char* str) override;
+  int textLineHeight() override { return 7; }
+  int nativeWidth() override;
+  int nativeHeight() override;
+  int toNativeY(int y) override;
+  void fillRectNative(int x, int y, int w, int h) override;
   void endFrame() override;
 
 protected:

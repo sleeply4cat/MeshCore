@@ -15,6 +15,9 @@
 #include <CRC32.h>
 
 #include "DisplayDriver.h"
+#ifdef EINK_FAST_PARTIAL
+  #include "GxEPD2_213_B74_Fast.h"
+#endif
 
 #ifndef EINK_MAX_PARTIAL_REFRESH
   // 60 to prevent ghosting when refreshing every minute ...
@@ -39,6 +42,7 @@ class GxEPDDisplay : public DisplayDriver {
 #endif
   bool _init = false;
   bool _isOn = false;
+  bool _native_drawn = false;
   uint16_t _curr_color;
   CRC32 display_crc;
   int last_display_crc_value = 0;
@@ -70,5 +74,13 @@ public:
   void drawRect(int x, int y, int w, int h) override;
   void drawXbm(int x, int y, const uint8_t* bits, int w, int h) override;
   uint16_t getTextWidth(const char* str) override;
+  int nativeWidth() override { return display.width(); }
+  int nativeHeight() override { return display.height(); }
+  int toNativeY(int y) override { return y * scale_y; }
+  void fillRectNative(int x, int y, int w, int h) override;
+#ifdef EINK_FAST_PARTIAL
+  bool setFastRefresh(bool fast) override { display.epd2.setFastPartial(fast); return true; }
+  bool wipe() override { return display.epd2.clearFast(); }
+#endif
   void endFrame() override;
 };

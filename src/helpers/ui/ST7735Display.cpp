@@ -575,6 +575,22 @@ void ST7735Display::drawXbm(int x, int y, const uint8_t* bits, int w, int h) {
   sprite->drawBitmap(x*SCALE_X, y*SCALE_Y, bits, w, h, curr_color);
 }
 
+int ST7735Display::nativeWidth() {
+  return 160;
+}
+
+int ST7735Display::nativeHeight() {
+  return 80;
+}
+
+int ST7735Display::toNativeY(int y) {
+  return y*SCALE_Y;
+}
+
+void ST7735Display::fillRectNative(int x, int y, int w, int h) {
+  sprite->fillRect(x, y, w, h, curr_color);
+}
+
 uint16_t ST7735Display::getTextWidth(const char* str) {
   return sprite->textWidth(str) / SCALE_X;
 }

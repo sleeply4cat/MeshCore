@@ -509,6 +509,26 @@ void NV3001BDisplay::print(const char* str) {
   }
 }
 
+int NV3001BDisplay::textLineHeight() {
+  return (int)(8 * NV3001B_TEXT_SIZE1_SCALE_Y / DISPLAY_SCALE_Y) + 1;
+}
+
+int NV3001BDisplay::nativeWidth() {
+  return NV3001B_SCREEN_WIDTH;
+}
+
+int NV3001BDisplay::nativeHeight() {
+  return NV3001B_SCREEN_HEIGHT;
+}
+
+int NV3001BDisplay::toNativeY(int y) {
+  return scaleY(y);
+}
+
+void NV3001BDisplay::fillRectNative(int x, int y, int w, int h) {
+  fillPhysicalRect(x, y, w, h);
+}
+
 void NV3001BDisplay::fillRect(int x, int y, int w, int h) {
   fillPhysicalRect(scaleX(x), scaleY(y), scaleWidth(x, w), scaleHeight(y, h));
 }
