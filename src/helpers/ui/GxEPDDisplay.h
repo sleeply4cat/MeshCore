@@ -15,20 +15,23 @@
 #include <CRC32.h>
 
 #include "DisplayDriver.h"
-#ifdef EINK_FAST_PARTIAL
-  #include "GxEPD2_213_B74_Fast.h"
+#ifdef EINK_FAST_PARTIAL   // the panel class with a fast partial refresh for live views (SSD1680 / SSD1681 panels)
+  #include "GxEPD2_Fast.h"
+  #define EINK_PANEL(model) GxEPD2_Fast<model>
+#else
+  #define EINK_PANEL(model) model
 #endif
 
 class GxEPDDisplay : public DisplayDriver {
 
 #if defined(EINK_DISPLAY_MODEL)
-  GxEPD2_BW<EINK_DISPLAY_MODEL, EINK_DISPLAY_MODEL::HEIGHT> display;
+  GxEPD2_BW<EINK_PANEL(EINK_DISPLAY_MODEL), EINK_DISPLAY_MODEL::HEIGHT> display;
   const float scale_x  = EINK_SCALE_X; 
   const float scale_y  = EINK_SCALE_Y;
   const float offset_x = EINK_X_OFFSET;
   const float offset_y = EINK_Y_OFFSET;
 #else
-  GxEPD2_BW<GxEPD2_150_BN, 200> display;
+  GxEPD2_BW<EINK_PANEL(GxEPD2_150_BN), 200> display;
   const float scale_x  = 1.5625f;
   const float scale_y  = 1.5625f;
   const float offset_x = 0;
@@ -43,9 +46,9 @@ class GxEPDDisplay : public DisplayDriver {
 
 public:
 #if defined(EINK_DISPLAY_MODEL)
-  GxEPDDisplay() : DisplayDriver(128, 128), display(EINK_DISPLAY_MODEL(PIN_DISPLAY_CS, PIN_DISPLAY_DC, PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)) {}
+  GxEPDDisplay() : DisplayDriver(128, 128), display(EINK_PANEL(EINK_DISPLAY_MODEL)(PIN_DISPLAY_CS, PIN_DISPLAY_DC, PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)) {}
 #else
-  GxEPDDisplay() : DisplayDriver(128, 128), display(GxEPD2_150_BN(DISP_CS, DISP_DC, DISP_RST, DISP_BUSY)) {}
+  GxEPDDisplay() : DisplayDriver(128, 128), display(EINK_PANEL(GxEPD2_150_BN)(DISP_CS, DISP_DC, DISP_RST, DISP_BUSY)) {}
 #endif
 
   bool begin();

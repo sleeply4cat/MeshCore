@@ -18,7 +18,10 @@
   #define EINK_FAST_FRAME_RATE  0x77  // SSD1680 FR code: 0x77 ~ 5.8ms per frame, 0x22 ~ 20ms
 #endif
 
-// GDEM0213B74 (SSD1680) with an optional fast partial refresh, for live views (eg. a spectrum):
+// A GxEPD2 panel class on an SSD1680 / SSD1681 controller (eg. GxEPD2_213_B74, GxEPD2_150_BN, GxEPD2_154_D67)
+// with an optional fast partial refresh, for live views (eg. a spectrum). Tuned on a GDEM0213B74 (Mesh Pocket);
+// other panels may want other EINK_FAST_FRAMES / EINK_FAST_FRAME_RATE for their contrast. The waveforms keep DC
+// balance whatever the settings: the same frames both ways.
 //  - a short custom waveform for the pixels that changed (optionally a kick the other way first, then
 //    towards the new colour), instead of the panel's built-in (OTP) partial waveform, which takes ~1s.
 //    Contrast is lower. 8 frames keep ~10 FPS; a 1-frame kick took visible contrast for little gain.
@@ -33,8 +36,21 @@
 //    costs ~18us per byte (a DMA setup each), ~220ms per refresh.
 //  - the refresh doesn't block: the next frame can be drawn while the panel updates. The 'previous'
 //    RAM (0x26) is written from our own copy just before the next frame, rather than after the refresh.
-class GxEPD2_213_B74_Fast : public GxEPD2_213_B74 {
-  enum { FRAME_BYTES = WIDTH / 8 * HEIGHT };
+template <class Panel>
+class GxEPD2_Fast : public Panel {
+  using Panel::_writeCommand;
+  using Panel::_writeData;
+  using Panel::_waitWhileBusy;
+  using Panel::_power_is_on;
+  using Panel::power_on_time;
+  using Panel::_initial_write;
+  using Panel::_initial_refresh;
+  using Panel::_init_display_done;
+  using Panel::_pSPIx;
+  using Panel::_spi_settings;
+  using Panel::_dc;
+  using Panel::_cs;
+  enum { FRAME_BYTES = Panel::WIDTH / 8 * Panel::HEIGHT };
   bool _fast = false, _refreshing = false, _prev_valid = false;
   uint8_t _prev[FRAME_BYTES];   // what the panel shows (or is busy showing)
 
@@ -96,27 +112,31 @@ class GxEPD2_213_B74_Fast : public GxEPD2_213_B74 {
   }
 
   bool isFullFrame(int16_t x, int16_t y, int16_t w, int16_t h, bool invert, bool mirror_y, bool pgm) const {
-    return x == 0 && y == 0 && w == WIDTH && h == HEIGHT && !invert && !mirror_y && !pgm
+    return x == 0 && y == 0 && w == Panel::WIDTH && h == Panel::HEIGHT && !invert && !mirror_y && !pgm
         && !_initial_write && _init_display_done;   // else let GxEPD2 do its init on the slow path
   }
 
   void writeFrame(uint8_t ram_cmd, const uint8_t* bitmap) {
     _writeCommand(0x11); _writeData(0x03);   // x, y increment
-    _writeCommand(0x44); _writeData(0x00); _writeData((WIDTH - 1) / 8);
-    _writeCommand(0x45); _writeData(0x00); _writeData(0x00); _writeData((HEIGHT - 1) % 256); _writeData((HEIGHT - 1) / 256);
+    _writeCommand(0x44); _writeData(0x00); _writeData((Panel::WIDTH - 1) / 8);
+    _writeCommand(0x45); _writeData(0x00); _writeData(0x00); _writeData((Panel::HEIGHT - 1) % 256); _writeData((Panel::HEIGHT - 1) / 256);
     _writeCommand(0x4e); _writeData(0x00);
     _writeCommand(0x4f); _writeData(0x00); _writeData(0x00);
     _writeCommand(ram_cmd);
     _pSPIx->beginTransaction(_spi_settings);
     digitalWrite(_dc, HIGH);
     digitalWrite(_cs, LOW);
+  #ifdef ESP32
+    _pSPIx->writeBytes(bitmap, FRAME_BYTES);
+  #else
     _pSPIx->transfer(bitmap, NULL, (size_t)FRAME_BYTES);
+  #endif
     digitalWrite(_cs, HIGH);
     _pSPIx->endTransaction();
   }
 
 public:
-  GxEPD2_213_B74_Fast(int16_t cs, int16_t dc, int16_t rst, int16_t busy) : GxEPD2_213_B74(cs, dc, rst, busy) { }
+  GxEPD2_Fast(int16_t cs, int16_t dc, int16_t rst, int16_t busy) : Panel(cs, dc, rst, busy) { }
 
   void setFastPartial(bool fast) {
     if (fast == _fast) return;
@@ -129,7 +149,7 @@ public:
   void writeImage(const uint8_t bitmap[], int16_t x, int16_t y, int16_t w, int16_t h, bool invert = false, bool mirror_y = false, bool pgm = false) {
     waitIdle();
     if (!isFullFrame(x, y, w, h, invert, mirror_y, pgm)) {
-      GxEPD2_213_B74::writeImage(bitmap, x, y, w, h, invert, mirror_y, pgm);
+      Panel::writeImage(bitmap, x, y, w, h, invert, mirror_y, pgm);
       return;
     }
     if (_fast) {
@@ -148,23 +168,23 @@ public:
       writeFrame(0x26, bitmap);
       writeFrame(0x24, bitmap);
     } else {
-      GxEPD2_213_B74::writeImageAgain(bitmap, x, y, w, h, invert, mirror_y, pgm);
+      Panel::writeImageAgain(bitmap, x, y, w, h, invert, mirror_y, pgm);
     }
   }
 
   void refresh(bool partial_update_mode = false) {
     if (partial_update_mode) {
-      refresh(0, 0, WIDTH, HEIGHT);
+      refresh(0, 0, Panel::WIDTH, Panel::HEIGHT);
     } else {
       waitIdle();
-      GxEPD2_213_B74::refresh(false);
+      Panel::refresh(false);
     }
   }
 
   void refresh(int16_t x, int16_t y, int16_t w, int16_t h) {
     waitIdle();
     if (!_fast || _initial_refresh) {
-      GxEPD2_213_B74::refresh(x, y, w, h);
+      Panel::refresh(x, y, w, h);
       return;
     }
     // always the whole panel: GxEPD2_BW::display() has just written the frame in full
@@ -189,6 +209,6 @@ public:
     return true;
   }
 
-  void powerOff() { waitIdle(); GxEPD2_213_B74::powerOff(); }
-  void hibernate() { waitIdle(); GxEPD2_213_B74::hibernate(); }
+  void powerOff() { waitIdle(); Panel::powerOff(); }
+  void hibernate() { waitIdle(); Panel::hibernate(); }
 };
