@@ -60,6 +60,15 @@ class CustomSX1262 : public SX1262 {
         tcxo = 0.0f;
         status = begin(LORA_FREQ, LORA_BW, LORA_SF, cr, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, LORA_TX_POWER, 16, tcxo, useRegulatorLDO);
       }
+      // Without a wired NRESET begin() can't reset the radio, and whatever an earlier run of the MCU left in it
+      // stays (eg. a spectrum view's plugin, fixed gain and held AGC, after a watchdog reset): a cold sleep resets
+      // it too, and begin() starts again (with the image calibration, see SX126xSpectrumScanner::end())
+      if (status == RADIOLIB_ERR_NONE && mod->getRst() == RADIOLIB_NC) {
+        sleep(false);
+        standby(RADIOLIB_SX126X_STANDBY_RC, true);   // wakes it, then waits for the boot (BUSY)
+        freqMHz = 0;
+        status = begin(LORA_FREQ, LORA_BW, LORA_SF, cr, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, LORA_TX_POWER, 16, tcxo, useRegulatorLDO);
+      }
       if (status != RADIOLIB_ERR_NONE) {
         Serial.print("ERROR: radio init failed: ");
         Serial.println(status);

@@ -42,8 +42,5 @@ public:
   int nativeHeight() override { return display.height(); }
   int toNativeY(int y) override;
   void fillRectNative(int x, int y, int w, int h) override;
-  bool hasColor() override { return true; }
-  void drawRgbRowNative(int x, int y, const uint16_t* rgb, int w) override { display.pushRow(x, y, rgb, w); }
-  bool wipe() override { display.wipe(); return true; }
   void endFrame() override;
 };
