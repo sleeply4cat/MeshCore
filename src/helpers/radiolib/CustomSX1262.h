@@ -2,6 +2,7 @@
 
 #include <RadioLib.h>
 #include "MeshCore.h"
+#include "SX126xSpectrumPlugin.h"
 
 class CustomSX1262 : public SX1262 {
   uint32_t _preambleMillis = 66;
@@ -58,6 +59,15 @@ class CustomSX1262 : public SX1262 {
       if (status == RADIOLIB_ERR_SPI_CMD_FAILED || status == RADIOLIB_ERR_SPI_CMD_INVALID) {
         MESH_DEBUG_PRINTLN("SX1262 init failed with error %d, retrying with TCXO at 0.0V", status);
         tcxo = 0.0f;
+        status = begin(LORA_FREQ, LORA_BW, LORA_SF, cr, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, LORA_TX_POWER, 16, tcxo, useRegulatorLDO);
+      }
+      // Without a wired NRESET, begin() can't reset the radio. If the MCU restarted during a spectrum session
+      // (SX126xSpectrumScanner), the chip still has its plugin, fixed gain and held AGC: a cold sleep resets it.
+      if (status == RADIOLIB_ERR_NONE && mod->getRst() == RADIOLIB_NC
+          && mod->SPIreadRegister(SX126X_SPECTRUM_PLUGIN_TAG_REG) == SX126X_SPECTRUM_PLUGIN_TAG) {
+        sleep(false);
+        standby(RADIOLIB_SX126X_STANDBY_RC, true);   // wakes it, then waits for the boot (BUSY)
+        freqMHz = 0;   // so that begin() redoes the image calibration
         status = begin(LORA_FREQ, LORA_BW, LORA_SF, cr, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, LORA_TX_POWER, 16, tcxo, useRegulatorLDO);
       }
       if (status != RADIOLIB_ERR_NONE) {

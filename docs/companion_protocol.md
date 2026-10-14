@@ -452,6 +452,62 @@ Byte 0: 0x14
 
 ---
 
+### 9. Spectrum Stream
+
+**Purpose**: Watch the spectrum around the node: the radio sweeps a band up and down, and the node pushes the strongest level of each point to the app to draw. The node leaves the mesh while it runs (it neither receives nor sends: messages sent meanwhile fail), and comes back with its radio settings, as they are by then, when the session ends.
+
+Available on nRF52 nodes with an SX1262 radio; other nodes reply `PACKET_ERROR` with `ERR_CODE_UNSUPPORTED_CMD` (1). Firmware reference: `examples/companion_radio/SpectrumSession.h`.
+
+**Start or change a session** (repeat at least every 15 seconds while watching, or the node ends it):
+```
+Byte 0:       0x43 (CMD_SPECTRUM)
+Byte 1:       0x01 (start)
+Bytes 2-5:    Centre frequency in Hz (uint32 LE; 0 = the node's own frequency)
+Bytes 6-9:    Span in Hz (uint32 LE; up to 32 MHz, at least 100 Hz per point, all of it within 150-960 MHz)
+Byte 10:      Points (16-250)
+Bytes 11-12:  Interval between frames in ms (uint16 LE; 10-5000, or 0 = a frame per sweep across the span)
+Byte 13:      Gain: 0 = the radio's AGC, 1-13 = a fixed gain step, lowest first
+```
+
+**Stop**:
+```
+Byte 0: 0x43
+Byte 1: 0x02
+```
+
+**Response** to both: `PACKET_SPECTRUM_INFO` (0x20), or `PACKET_ERROR` with `ERR_CODE_ILLEGAL_ARG` (6) for settings out of range:
+```
+Byte 0:       0x20
+Byte 1:       State: 0 = off, 1 = starting (the node finishes a packet first), 2 = running
+Byte 2:       Config: changes with the sweep settings
+Byte 3:       Points
+Bytes 4-7:    Frequency of the first point in Hz (uint32 LE); each point is the centre of its share of the span
+Bytes 8-11:   Step between points in Hz (uint32 LE)
+Bytes 12-15:  Resolution bandwidth in Hz (uint32 LE): ~2.5 steps, 4.8-467 kHz
+Bytes 16-17:  Interval in ms (uint16 LE)
+Byte 18:      Gain
+```
+
+**Frames** are pushed as `PACKET_SPECTRUM_FRAME` (0x92): the strongest level of each point over the whole sweeps since the previous frame. A frame of more points than fit one packet (172) comes in several pushes with the same frame number:
+```
+Byte 0:       0x92
+Byte 1:       Config (frames of earlier settings may still arrive after a change: drop them)
+Byte 2:       Frame number (counts frames, mod 256)
+Byte 3:       Index of the first point in this push
+Bytes 4+:     A level per point: -2 × dBm (eg. 200 = -100 dBm)
+```
+
+**The end of a session** that the app didn't stop is pushed as `PACKET_SPECTRUM_STOPPED` (0x93):
+```
+Byte 0:       0x93
+Byte 1:       Reason: 1 = not renewed for 15 s, 2 = radio error
+Bytes 2-3:    Radio error code (int16 LE, for reason 2)
+```
+
+A session also ends, silently, when no app is connected any more.
+
+---
+
 ## Channel Management
 
 ### Channel Types
@@ -662,10 +718,13 @@ Byte values are authoritative; names are aliases. When reading firmware source, 
 | 0x11  | PACKET_CHANNEL_MSG_RECV_V3 | Channel message (V3 with SNR) |
 | 0x12  | PACKET_CHANNEL_INFO        | Channel information           |
 | 0x1B  | PACKET_CHANNEL_DATA_RECV   | Channel data datagram         |
+| 0x20  | PACKET_SPECTRUM_INFO       | Spectrum session state        |
 | 0x80  | PACKET_ADVERTISEMENT       | Advertisement packet          |
 | 0x82  | PACKET_ACK                 | Acknowledgment                |
 | 0x83  | PACKET_MESSAGES_WAITING    | Messages waiting notification |
 | 0x88  | PACKET_LOG_DATA            | RF log data (can be ignored)  |
+| 0x92  | PACKET_SPECTRUM_FRAME      | Spectrum levels               |
+| 0x93  | PACKET_SPECTRUM_STOPPED    | Spectrum session ended        |
 
 ### Parsing Responses
 

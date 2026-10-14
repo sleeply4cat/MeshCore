@@ -13,6 +13,7 @@ public:
   CustomSX1262Wrapper(CustomSX1262& radio, mesh::MainBoard& board) : RadioLibWrapper(radio, board) { }
 
   void setParams(float freq, float bw, uint8_t sf, uint8_t cr) override {
+    if (isBorrowed()) return;
     ((CustomSX1262 *)_radio)->setFrequency(freq);
     ((CustomSX1262 *)_radio)->setSpreadingFactor(sf);
     ((CustomSX1262 *)_radio)->setBandwidth(bw);
@@ -29,8 +30,8 @@ public:
   float getCurrentRSSI() override {
     return ((CustomSX1262 *)_radio)->getRSSI(false);
   }
-  float getLastRSSI() const override { return ((CustomSX1262 *)_radio)->getRSSI(); }
-  float getLastSNR() const override { return ((CustomSX1262 *)_radio)->getSNR(); }
+  float getLastRSSI() const override { return isBorrowed() ? 0 : ((CustomSX1262 *)_radio)->getRSSI(); }
+  float getLastSNR() const override { return isBorrowed() ? 0 : ((CustomSX1262 *)_radio)->getSNR(); }
 
   float packetScore(float snr, int packet_len) override {
     int sf = ((CustomSX1262 *)_radio)->spreadingFactor;
@@ -38,10 +39,12 @@ public:
   }
   uint8_t getSpreadingFactor() const override { return ((CustomSX1262 *)_radio)->spreadingFactor; }
   virtual void powerOff() override {
+    reclaim();
     ((CustomSX1262 *)_radio)->sleep(false);
   }
 
   bool setRxBoostedGainMode(bool en) override {
+    if (isBorrowed()) return true;   // the borrower sets it up again
     return ((CustomSX1262 *)_radio)->setRxBoostedGainMode(en) == RADIOLIB_ERR_NONE;
   }
   bool getRxBoostedGainMode() const override {
