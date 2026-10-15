@@ -1021,7 +1021,23 @@ void UITask::loop() {
   if (curr) curr->poll();
 
   if (_display != NULL && _display->isOn()) {
-    if (millis() >= _next_refresh && curr) {
+    // While the radio is borrowed (eg. by a spectrum stream), one notice instead of the screens: a refresh holds
+    // up the main loop that serves the borrower (an e-ink one for long), and the mesh pages would show it as it was
+    if (radio_driver.isBorrowed() != _radio_borrowed) {
+      _radio_borrowed = !_radio_borrowed;
+      if (_radio_borrowed) {
+        _display->startFrame();
+        _display->setTextSize(1);
+        _display->setColor(UIColor::title_txt);
+        _display->drawTextCentered(_display->width() / 2, _display->height() / 3, "Radio in use");
+        _display->setColor(UIColor::primary_txt);
+        _display->drawTextCentered(_display->width() / 2, _display->height() / 2, "mesh offline");
+        _display->endFrame();
+      } else {
+        _next_refresh = 0;   // back to the current screen
+      }
+    }
+    if (!_radio_borrowed && millis() >= _next_refresh && curr) {
       _display->startFrame();
       int delay_millis = curr->render(*_display);
       if (millis() < _alert_expiry) {  // render alert popup

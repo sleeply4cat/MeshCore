@@ -11,10 +11,18 @@ struct PacketMillis {
   uint32_t payloadMillis;   // header-valid   -> rx-done deadline
 };
 
+// Something else that uses the radio chip for a while, eg. a scan (see RadioLibWrapper::borrow()).
+class RadioBorrower {
+public:
+  // The chip is wanted back at once (eg. to power off): leave it as from a reset, and giveBack().
+  virtual void returnRadio() = 0;
+};
+
 class RadioLibWrapper : public mesh::Radio {
 protected:
   PhysicalLayer* _radio;
   mesh::MainBoard* _board;
+  RadioBorrower* _borrower;
   uint32_t n_recv, n_sent, n_recv_errors;
   int16_t _noise_floor, _threshold;
   bool _cad_enabled;
@@ -27,12 +35,24 @@ protected:
   float packetScoreInt(float snr, int sf, int packet_len);
   virtual bool isReceivingPacket() =0;
   virtual void doResetAGC();
+  void reclaim();   // the chip back from a borrower, if borrowed
 
 public:
-  RadioLibWrapper(PhysicalLayer& radio, mesh::MainBoard& board) : _radio(&radio), _board(&board), _preamble_sf(0) { n_recv = n_sent = 0; }
+  RadioLibWrapper(PhysicalLayer& radio, mesh::MainBoard& board) : _radio(&radio), _board(&board), _borrower(NULL), _preamble_sf(0) { n_recv = n_sent = 0; }
 
   void begin() override;
-  virtual void powerOff() { _radio->sleep(); }
+
+  // Hands the chip to 'borrower', if idle in RX (no packet coming or waiting) and not borrowed already. Until
+  // giveBack(), this wrapper leaves the chip alone: the mesh receives nothing and finds the channel busy (so a
+  // packet to send fails after the CAD timeout), and settings (setParams() etc.) don't reach the chip: the
+  // borrower sets them up again after giveBack(). Subclasses that talk to the chip themselves leave it alone
+  // too while isBorrowed() (as CustomSX1262Wrapper does).
+  bool borrow(RadioBorrower* borrower);
+  // From the borrower, once the chip is as radio_init() left it.
+  void giveBack();
+  bool isBorrowed() const;
+
+  virtual void powerOff() { reclaim(); _radio->sleep(); }
   int recvRaw(uint8_t* bytes, int sz) override;
   uint32_t getEstAirtimeFor(int len_bytes) override;
   bool startSendRaw(const uint8_t* bytes, int len) override;
@@ -42,7 +62,7 @@ public:
   bool isChannelActive();
 
   bool isReceiving() override {
-    if (isReceivingPacket()) return true;
+    if (isBorrowed() || isReceivingPacket()) return true;
 
     return isChannelActive();
   }

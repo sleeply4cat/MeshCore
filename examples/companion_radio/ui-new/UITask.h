@@ -56,6 +56,7 @@ class UITask : public AbstractUITask {
   GenericVibration vibration;
 #endif
   unsigned long _next_refresh, _auto_off;
+  bool _radio_borrowed = false;   // see loop()
   NodePrefs* _node_prefs;
   char _alert[80];
   unsigned long _alert_expiry;
