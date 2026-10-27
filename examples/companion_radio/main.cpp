@@ -112,9 +112,26 @@ MultiSerialInterface interface_manager;
   UITask ui_task(&board, &interface_manager);
 #endif
 
+// The spectrum view's sweeps to a BLE client next to the app's UART (SpectrumBLEService, on SX1262 radios): from
+// ui-new's spectrum page (SPECTRUM_BLE from its UITask.h), or where no UI has the page, from a view of its own
+#if !defined(SPECTRUM_BLE) && defined(BLE_PIN_CODE) && (defined(NRF52_PLATFORM) || defined(ESP32))
+  #define SPECTRUM_BLE 1
+  #define SPECTRUM_HEADLESS 1
+#endif
+#if SPECTRUM_BLE
+  #include <type_traits>
+  #include "SpectrumBLEService.h"
+  SpectrumBLEService spectrum_ble;
+  static const bool spectrum_radio = std::is_base_of<SX1262, RADIO_CLASS>::value;   // else it can't scan
+#endif
+
 StdRNG fast_rng;
 SimpleMeshTables tables;
 MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store);
+#if SPECTRUM_HEADLESS
+  #include "SpectrumHeadless.h"
+  SpectrumHeadless spectrum_headless(the_mesh.getNodePrefs());
+#endif
 
 /* END GLOBAL OBJECTS */
 
@@ -206,7 +223,19 @@ void setup() {
 
 // add bluetooth interface
 #if defined(BLE_PIN_CODE)
+  #if SPECTRUM_BLE
+  if (spectrum_radio) {
+  #if defined(NRF52_PLATFORM)
+    bluetooth_interface.setMaxConnections(2, 8);   // the spectrum client next to the app, and room for its frames
+  #else
+    bluetooth_interface.setMaxConnections(2);
+  #endif
+  }
+  #endif
   bluetooth_interface.begin(BLE_NAME_PREFIX, the_mesh.getNodePrefs()->node_name, the_mesh.getBLEPin());
+  #if SPECTRUM_BLE
+  if (spectrum_radio) spectrum_ble.begin(bluetooth_interface);   // before advertising starts
+  #endif
   interface_manager.addInterface(InterfaceType::Bluetooth, &bluetooth_interface);
 #endif
 
@@ -295,6 +324,9 @@ void loop() {
   sensors.loop();
 #ifdef DISPLAY_CLASS
   ui_task.loop();
+#endif
+#if SPECTRUM_HEADLESS
+  spectrum_headless.loop();
 #endif
   rtc_clock.tick();
   board.loop();

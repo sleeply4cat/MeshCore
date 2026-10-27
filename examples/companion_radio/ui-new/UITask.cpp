@@ -4,11 +4,6 @@
 #include "target.h"
 #include <time.h>
 
-#ifndef UI_SPECTRUM_PAGE   // the spectrum page, where its scan can run in a task of its own (FreeRTOS)
-  #if defined(NRF52_PLATFORM) || defined(ESP32)
-    #define UI_SPECTRUM_PAGE 1
-  #endif
-#endif
 #ifdef ENABLE_WIFI_INTERFACE
   #include <WiFi.h>
 #endif
@@ -753,19 +748,51 @@ public:
 
 #if UI_SPECTRUM_PAGE == 1
 #include "../SpectrumView.h"
+#if SPECTRUM_BLE
+  #include "../SpectrumBLEStream.h"
+#endif
 
 class SpectrumScreen : public UIScreen, SpectrumView::Host {
   UITask* _task;
   SpectrumView _view;
+  bool _for_client = false;
+#if SPECTRUM_BLE
+  SpectrumBLEStream _ble;
+#endif
 
 public:
-  SpectrumScreen(UITask* task, NodePrefs* prefs) : _task(task), _view(this, prefs) { }
+  SpectrumScreen(UITask* task, NodePrefs* prefs) : _task(task), _view(this, prefs) {
+  #if SPECTRUM_BLE
+    _view.setStream(&_ble);
+  #endif
+  }
 
-  void spectrumAlert(const char* text, int duration_ms) override { _task->showAlert(text, duration_ms); }
-  void spectrumExit() override { _task->gotoHomeScreen(); }   // stops the view, see UITask::setCurrScreen()
+  void spectrumAlert(const char* text, int duration_ms) override {
+    _task->showAlert(text, duration_ms);
+    _task->triggerRefresh();   // eg. from the BLE client: no key press asks for a frame
+  }
+  void spectrumExit() override {
+    if (_for_client) stop();
+    else _task->gotoHomeScreen();   // stops the view, see UITask::setCurrScreen()
+  }
+  void spectrumOpen() override { _task->startSpectrumForClient(); }   // a BLE client asks for the view
+  bool spectrumClientMayStop() override { return _for_client; }        // not the one on the display
+#if SPECTRUM_BLE
+  // the BLE client's requests and the state it sees, whatever the screen; a view it opened lasts while it listens
+  void streamLoop() {
+    _view.streamLoop();
+    if (_for_client && _view.isOpen() && !_ble.hasSubscribers()) stop();
+  }
+#endif
 
   bool ownsRadio() const { return _view.ownsRadio(); }
-  void start(DisplayDriver& d) { _view.start(d); }
+  bool isOpen() const { return _view.isOpen(); }
+  bool isForClient() const { return _for_client && _view.isOpen(); }
+  // for_client: opened by the BLE client, which alone gets the sweeps; d: NULL for none (also when none found)
+  void start(DisplayDriver* d, bool for_client) {
+    _for_client = for_client;
+    _view.start(d);
+  }
   void stop() { _view.stop(); }
   void poll() override { _view.poll(); }
   int render(DisplayDriver& d) override { return _view.render(d); }
@@ -814,7 +841,11 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   home = new HomeScreen(this, &rtc_clock, sensors, node_prefs);
   msg_preview = new MsgPreviewScreen(this, &rtc_clock);
 #if UI_SPECTRUM_PAGE == 1
+#if SPECTRUM_BLE
+  spectrum = new SpectrumScreen(this, node_prefs);   // without a display, for the BLE client alone
+#else
   if (_display != NULL) spectrum = new SpectrumScreen(this, node_prefs);   // none found: no page to show it on
+#endif
 #endif
   setCurrScreen(splash);
 }
@@ -980,21 +1011,34 @@ void UITask::shutdown(bool restart){
 
 void UITask::gotoSpectrumScreen() {
 #if UI_SPECTRUM_PAGE == 1
-  if (_display == NULL || spectrum == NULL) return;
-  ((SpectrumScreen *) spectrum)->start(*_display);
+  if (spectrum == NULL) return;
+  // a view the BLE client opened moves to the display (the client keeps getting its frames)
+  if (((SpectrumScreen *) spectrum)->isForClient()) ((SpectrumScreen *) spectrum)->stop();
+  ((SpectrumScreen *) spectrum)->start(_display, false);   // NULL: none found
   setCurrScreen(spectrum);
 #endif
 }
 
+void UITask::startSpectrumForClient() {
+#if UI_SPECTRUM_PAGE == 1
+  if (spectrum == NULL || ((SpectrumScreen *) spectrum)->isOpen()) return;
+  ((SpectrumScreen *) spectrum)->start(NULL, true);   // the display stays on its screen
+  showAlert("Spectrum on BLE", 2000);
+  triggerRefresh();   // no key press asks for a frame
+#endif
+}
+
+
 void UITask::releaseRadio() {
 #if UI_SPECTRUM_PAGE == 1
   if (spectrum != NULL && curr == spectrum) gotoHomeScreen();   // stops the scan and hands the radio back to the mesh
+  else if (spectrum != NULL) ((SpectrumScreen *) spectrum)->stop();   // the BLE client's, if open
 #endif
 }
 
 bool UITask::isRadioBorrowed() const {
 #if UI_SPECTRUM_PAGE == 1
-  return spectrum != NULL && curr == spectrum && ((SpectrumScreen *) spectrum)->ownsRadio();
+  return spectrum != NULL && ((SpectrumScreen *) spectrum)->ownsRadio();   // on the display, or the BLE client's
 #else
   return false;
 #endif
@@ -1107,6 +1151,12 @@ void UITask::loop() {
   if (buzzer.isPlaying())  buzzer.loop();
 #endif
 
+#if SPECTRUM_BLE
+  if (spectrum != NULL) {
+    ((SpectrumScreen *) spectrum)->streamLoop();
+    if (curr != spectrum) spectrum->poll();   // the BLE client's view, off the display
+  }
+#endif
   if (curr) curr->poll();
 
   if (_display != NULL && _display->isOn()) {
@@ -1138,7 +1188,7 @@ void UITask::loop() {
       _auto_off = millis() + AUTO_OFF_MILLIS;
     }
 #endif
-    if (isRadioBorrowed()) {
+    if (curr == spectrum && isRadioBorrowed()) {
       _auto_off = millis() + AUTO_OFF_MILLIS;   // a live view, and a reminder that the mesh is paused
     }
     if (millis() > _auto_off) {

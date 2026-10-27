@@ -30,6 +30,16 @@
   #define UI_DISCOVER_SCREEN  1
 #endif
 
+#ifndef UI_SPECTRUM_PAGE   // the spectrum page, where its scan can run in a task of its own (FreeRTOS)
+  #if defined(NRF52_PLATFORM) || defined(ESP32)
+    #define UI_SPECTRUM_PAGE 1
+  #endif
+#endif
+// the page's stream to a BLE client next to the app (SpectrumBLEService, set up in main.cpp)
+#if !defined(SPECTRUM_BLE) && UI_SPECTRUM_PAGE == 1 && defined(BLE_PIN_CODE)
+  #define SPECTRUM_BLE 1
+#endif
+
 #if UI_DISCOVER_SCREEN
   #ifdef UI_RECENT_LIST_SIZE
     #define DISCOVERED_NODES_TABLE_SIZE UI_RECENT_LIST_SIZE
@@ -99,6 +109,7 @@ public:
 
   void gotoHomeScreen() { setCurrScreen(home); }
   void gotoSpectrumScreen();
+  void startSpectrumForClient();      // the spectrum for the BLE client alone, not on the display
   void releaseRadio();
   void triggerRefresh() { _next_refresh = 0; }
   void showAlert(const char* text, int duration_millis);

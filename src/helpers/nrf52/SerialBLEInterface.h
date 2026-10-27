@@ -7,6 +7,17 @@
 #define BLE_TX_POWER 4
 #endif
 
+// Peripheral connections (default; setMaxConnections() before begin()): more than 1 lets other clients (eg. the
+// spectrum page, SpectrumBLEService) connect next to the app. The app's connection is the one using the UART
+// service; the others don't touch it.
+#ifndef BLE_MAX_CONNECTIONS
+#define BLE_MAX_CONNECTIONS 1
+#endif
+// notifications the SoftDevice queues per connection (3 by default): more for streams (SpectrumBLEService)
+#ifndef BLE_HVN_QUEUE_SIZE
+#define BLE_HVN_QUEUE_SIZE 3
+#endif
+
 class SerialBLEInterface : public BaseSerialInterface {
   BLEDfu bledfu;
   BLEUart bleuart;
@@ -15,6 +26,8 @@ class SerialBLEInterface : public BaseSerialInterface {
   uint16_t _conn_handle;
   unsigned long _last_health_check;
   unsigned long _last_retry_attempt;
+  uint8_t _max_conn;
+  uint8_t _hvn_queue;
 
   struct Frame {
     uint8_t len;
@@ -34,6 +47,10 @@ class SerialBLEInterface : public BaseSerialInterface {
   void shiftRecvQueueLeft();
   bool isValidConnection(uint16_t handle, bool requireWaitingForSecurity = false) const;
   bool isAdvertising() const;
+  bool hasAppConnection() const;
+  void adoptConnection(uint16_t handle);
+  void restartAdvertising();
+  static void requestConnParams(uint16_t handle);
   static void onConnect(uint16_t connection_handle);
   static void onDisconnect(uint16_t connection_handle, uint8_t reason);
   static void onSecured(uint16_t connection_handle);
@@ -41,6 +58,7 @@ class SerialBLEInterface : public BaseSerialInterface {
   static void onPairingComplete(uint16_t connection_handle, uint8_t auth_status);
   static void onBLEEvent(ble_evt_t* evt);
   static void onBleUartRX(uint16_t conn_handle);
+  static void onBleUartNotify(uint16_t conn_handle, bool enabled);
 
 public:
   SerialBLEInterface() {
@@ -49,6 +67,8 @@ public:
     _conn_handle = BLE_CONN_HANDLE_INVALID;
     _last_health_check = 0;
     _last_retry_attempt = 0;
+    _max_conn = BLE_MAX_CONNECTIONS;
+    _hvn_queue = BLE_HVN_QUEUE_SIZE;
     send_queue_len = 0;
     recv_queue_len = 0;
   }
@@ -60,6 +80,8 @@ public:
    * @param pin_code   the BLE security pin
    */
   void begin(const char* prefix, char* name, uint32_t pin_code);
+  // before begin(): peripheral connections, and notifications queued per connection
+  void setMaxConnections(uint8_t n, uint8_t hvn_queue) { _max_conn = n; _hvn_queue = hvn_queue; }
 
   void disconnect();
   void enable() override;
