@@ -16,7 +16,11 @@
 
 #include "DisplayDriver.h"
 #ifdef EINK_FAST_PARTIAL
+  // the fast partial refresh for live views: made for, and checked on, the GDEM0213B74 (SSD1680) alone, whose
+  // GxEPD2_213_B74 it replaces (Mesh Pocket, Wio Tracker L1 E-ink)
   #include "GxEPD2_213_B74_Fast.h"
+  #undef EINK_DISPLAY_MODEL
+  #define EINK_DISPLAY_MODEL GxEPD2_213_B74_Fast
 #endif
 
 #ifndef EINK_MAX_PARTIAL_REFRESH

@@ -6,6 +6,7 @@
 #define STATE_RX         1
 #define STATE_TX_WAIT    3
 #define STATE_TX_DONE    4
+#define STATE_BORROWED   5
 #define STATE_INT_READY 16
 
 #define NUM_NOISE_FLOOR_SAMPLES  64
@@ -43,24 +44,42 @@ void RadioLibWrapper::begin() {
   _floor_sample_sum = 0;
 }
 
-void RadioLibWrapper::onExternalReinit() {
-  _radio->setPacketReceivedAction(setFlag);
-  state = STATE_IDLE;   // trigger a startReceive(), discarding any stale interrupt
-
-  _noise_floor = 0;
-  _num_floor_samples = 0;
-  _floor_sample_sum = 0;
-}
-
 uint32_t RadioLibWrapper::getRngSeed() {
   return _radio->random(0x7FFFFFFF);
 }
 
 void RadioLibWrapper::setTxPower(int8_t dbm) {
+  if (isBorrowed()) return;
 #if defined(USE_LR2021)
   idle();
 #endif
   _radio->setOutputPower(dbm);
+}
+
+bool RadioLibWrapper::borrow(RadioBorrower* borrower) {
+  if (state != STATE_RX || isReceivingPacket()) return false;
+  _borrower = borrower;
+  state = STATE_BORROWED;
+  return true;
+}
+
+void RadioLibWrapper::giveBack() {
+  _borrower = NULL;
+  _radio->setPacketReceivedAction(setFlag);   // the borrower's setup may have changed it
+  state = STATE_IDLE;   // trigger a startReceive(), dropping any interrupt from the borrower's use
+
+  // the noise floor sampled anew
+  _noise_floor = 0;
+  _num_floor_samples = 0;
+  _floor_sample_sum = 0;
+}
+
+bool RadioLibWrapper::isBorrowed() const {
+  return (state & ~STATE_INT_READY) == STATE_BORROWED;
+}
+
+void RadioLibWrapper::reclaim() {
+  if (isBorrowed()) _borrower->returnRadio();
 }
 
 void RadioLibWrapper::idle() {
@@ -82,7 +101,7 @@ void RadioLibWrapper::doResetAGC() {
 
 void RadioLibWrapper::resetAGC() {
   // make sure we're not mid-receive of packet!
-  if ((state & STATE_INT_READY) != 0 || isReceivingPacket()) return;
+  if (isBorrowed() || (state & STATE_INT_READY) != 0 || isReceivingPacket()) return;
 
   doResetAGC();
   state = STATE_IDLE;   // trigger a startReceive()
@@ -131,14 +150,11 @@ void RadioLibWrapper::startRecv() {
 }
 
 bool RadioLibWrapper::isInRecvMode() const {
-  return (state & ~STATE_INT_READY) == STATE_RX;
-}
-
-bool RadioLibWrapper::isIdleInRecvMode() {
-  return state == STATE_RX && !isReceivingPacket();
+  return (state & ~STATE_INT_READY) == STATE_RX || isBorrowed();   // borrowed: not stuck
 }
 
 int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {
+  if (isBorrowed()) return 0;
   int len = 0;
   if (state & STATE_INT_READY) {
     len = _radio->getPacketLength();
@@ -177,6 +193,7 @@ uint32_t RadioLibWrapper::getEstAirtimeFor(int len_bytes) {
 }
 
 bool RadioLibWrapper::startSendRaw(const uint8_t* bytes, int len) {
+  if (isBorrowed()) return false;
   _board->onBeforeTransmit();
   int err = _radio->startTransmit((uint8_t *) bytes, len);
   if (err == RADIOLIB_ERR_NONE) {
@@ -227,10 +244,10 @@ bool RadioLibWrapper::isChannelActive() {
 }
 
 float RadioLibWrapper::getLastRSSI() const {
-  return _radio->getRSSI();
+  return isBorrowed() ? 0 : _radio->getRSSI();
 }
 float RadioLibWrapper::getLastSNR() const {
-  return _radio->getSNR();
+  return isBorrowed() ? 0 : _radio->getSNR();
 }
 
 // Approximate SNR threshold per SF for successful reception (based on Semtech datasheets)

@@ -11,7 +11,7 @@
 #endif
 
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.18.0+sp6"   // +sp: the spectrum page build (not a dash: the splash screen cuts there)
+#define FIRMWARE_VERSION "v1.18.0+sp7"   // +sp: the spectrum page build (not a dash: the splash screen cuts there)
 #endif
 
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
@@ -105,7 +105,6 @@ public:
       virtual void onTraceRecv(mesh::Packet *pkt, uint32_t tag, uint32_t auth_code, uint8_t flags,
                                const uint8_t *path_snrs, const uint8_t *path_hashes, uint8_t path_len) { }
       virtual void onRawDataRecv(mesh::Packet *pkt) { }
-      virtual bool isRadioBorrowed() const { return false; }   // true while the UI has taken over the radio (eg. spectrum scan)
       virtual ~Listener() { }
   };
 
@@ -239,7 +238,6 @@ private:
   // helpers, short-cuts
   void saveChannels() { _store->saveChannels(this); }
   void saveContacts();
-  bool isRadioBorrowed() const { return _listener != NULL && _listener->isRadioBorrowed(); }
 
   DataStore* _store;
   NodePrefs _prefs;

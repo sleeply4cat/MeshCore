@@ -1447,7 +1447,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       _prefs.setRepeatEn(repeat != 0);
       savePrefs();
 
-      if (!isRadioBorrowed()) radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);   // else the UI applies _prefs when it hands the radio back
+      radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
       MESH_DEBUG_PRINTLN("OK: CMD_SET_RADIO_PARAMS: f=%d, bw=%d, sf=%d, cr=%d", freq, bw, (uint32_t)sf,
                          (uint32_t)cr);
 
@@ -1464,7 +1464,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       _prefs.tx_power_dbm = power;
       savePrefs();
-      if (!isRadioBorrowed()) radio_driver.setTxPower(_prefs.tx_power_dbm);   // else applied when the UI hands the radio back
+      radio_driver.setTxPower(_prefs.tx_power_dbm);
       writeOKFrame();
     }
   } else if (cmd_frame[0] == CMD_SET_TUNING_PARAMS) {
@@ -2413,8 +2413,7 @@ void MyMesh::checkSerialInterface() {
 }
 
 void MyMesh::loop() {
-  // while the UI has the radio (spectrum view), the mesh is paused, but the app is still served
-  if (!isRadioBorrowed()) BaseChatMesh::loop();
+  BaseChatMesh::loop();
 
   if (_cli_rescue) {
     checkCLIRescueCmd();

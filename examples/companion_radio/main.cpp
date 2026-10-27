@@ -302,9 +302,9 @@ void loop() {
   external_watchdog.loop();
 #endif
 
-#if (defined(NRF52_PLATFORM) || defined(ESP32)) && defined(DISPLAY_CLASS)
-  if (ui_task.isRadioBorrowed()) {
-    delay(1);   // the mesh is paused while the UI owns the radio: block this task, so the UI's scan task gets the CPU
+#if defined(NRF52_PLATFORM) || defined(ESP32)
+  if (radio_driver.isBorrowed()) {
+    delay(1);   // the mesh can't use the radio meanwhile: block this task, so a scan task gets the CPU
   } else
 #endif
   if (!the_mesh.hasPendingWork()) {

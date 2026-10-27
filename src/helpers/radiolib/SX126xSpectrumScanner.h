@@ -3,100 +3,111 @@
 #include <RadioLib.h>
 #include "SX126xSpectrumPlugin.h"
 
-// SDR-like frequency sweep for SX126x. The whole sweep runs inside the radio, in our own PRAM plugin
-// (SX126xSpectrumPlugin.h): the radio's core retunes itself right after every RSSI
-// update and files the (latency + 1)-th update after a retune under that point (the receiver chain shows a
-// frequency change in the RSSI only ~3.4 updates later). The host sends one command and reads one buffer.
-// The plugin's addresses were found on ROM "SX1261 V2D 2D02" (in SX1262s too): begin() refuses other ROMs.
+// Frequency sweeps on an SX1262, run by the radio itself. A plugin on the radio's core (SX126xSpectrumPlugin.h)
+// sweeps on in the background, in rows up and down the span: it retunes the receiver after every RSSI update,
+// files the reading that belongs to each point, and keeps the strongest level per point until the host takes
+// it, at the end of a row (readFrame()).
 //
-// The RSSI register updates every ~1.6/RBW ms (RBW in kHz), and a point costs ~1 update: 250 points take
-// ~56ms at RBW 7.3kHz, ~21ms at 19.5kHz, ~5ms at 78kHz.
-// The plugin only lives in the radio's RAM: a reset or a sleep removes it. Many boards don't wire the radio's
-// NRESET (P_LORA_RESET = RADIOLIB_NC: Heltec V3, Wireless Paper, ...), so RadioLib's begin() can't reset it there;
-// begin() and end() reset it with a sleep instead.
-// While active, the radio is in GFSK RX and unusable for LoRa traffic.
+// The RSSI register updates every ~1.6/RBW ms (RBW in kHz) and a point takes about one update: a row of 250
+// points takes ~56ms at an RBW of 7.3kHz, ~21ms at 19.5kHz, ~5ms at 78kHz.
 //
-// Gain: fixed at the AGC's top step (7C), with the AGC held. With the AGC free, the gain steps down from ~-85 dBm in
-// the channel and back ~5 RSSI updates after the signal is gone, and every step holds the RSSI register for ~6 more
-// updates: a sweep showed a strong narrow signal with a shelf of ~10 points after it. The RSSI stays calibrated at
-// a fixed step. Also found on hardware (sxplug docs/measurements.md), and handled here:
-// - a strong signal near the channel (before the channel filter) makes the AGC try to step down at once; with a
-//   fixed step that never happens and the RSSI stops for good (from ~-34 dBm at the top step), and a held AGC
-//   drops to its lowest step and stays there. 0x08B5 bit 0 prevents both (MeshCore sets it on boards with a
-//   front-end LNA, SX126X_REGISTER_PATCH); sweep() still restarts the receiver if the RSSI looks stuck;
-// - after a SetRfFrequency the image rejection is 15..30 dB instead of ~43 until a CalibrateImage (a strong signal
-//   shows again 2 x IF away), which RadioLib only does on a move of several MHz: setSweep() calibrates every time.
+// While begin() is in effect the radio is in GFSK RX and can't do LoRa. end() resets the chip with a cold sleep
+// (many boards don't wire NRESET), which removes the plugin and every setting made here.
+//
+// Gain: the radio's AGC (default), or a fixed step (setGain()). The AGC steps the gain down from ~-85dBm in the
+// channel and back up ~5 RSSI updates after the signal is gone, and every step holds the RSSI register for ~6
+// more updates: a sweep shows a strong signal with a shelf of ~10 points after it. A fixed step has none of
+// that, and the RSSI stays calibrated at every step; a lower step takes stronger signals at the cost of noise.
+// Register 0x08B5 bit 0 (also set by CustomSX1262 for boards with SX126X_REGISTER_PATCH) keeps a strong signal
+// near the channel from stopping the RSSI: without it a fixed step's RSSI freezes for good from ~-34dBm at the
+// top steps (-5dBm at the lowest) until the receiver restarts, and a held AGC drops to its lowest step and stays.
+// The registers of this paragraph aren't in the datasheet: they were found on hardware.
 class SX126xSpectrumScanner {
   enum {
-    CMD_SWEEP = 0x9B,
-    REG_RESULT = 0x0400,        // RADIO_BUF
-    REG_VERSION = 0x0320,       // ROM version string, 16 bytes
-    REG_VERSION_TAG = 0x032E,   // last char of the version string, set by the plugin's init
-    REG_MANUAL_GAIN = 0x08B6,   // bit 5: a fixed gain step, in bits 3..0 (1..13, lowest first)
-    REG_AGC_HOLD = 0x08A7,      // bit 0: the AGC holds still
-    REG_AGC_STATE = 0x08BF,     // bit 1: the RSSI held for a gain change (with a fixed step: maybe stuck)
-    REG_AGC_PATCH = 0x08B5,     // bit 0: no stuck RSSI on strong signals (see the top)
-    GAIN_STEP = 13,             // 7C, the top
-    // a step written sooner after SetRx doesn't take, and the RSSI stays dead: from STDBY_XOSC (the TCXO kept on)
-    // the receiver needs ~0.5 ms at an RBW of 19.5 kHz, 1-2 ms at 4.8-7.3 kHz
-    GAIN_AFTER_RX_MS = 5,
-    // In GFSK RX a packet (or noise passing for one) is written to the data buffer, which also holds the
-    // results: fixed length 1, at the very end of the buffer, keeps it out of the way
+    CMD_HOLD = 0x9C,            // the plugin's command: sweeps in the background, the strongest level per point kept
+    REG_HOLD_DONE = 0x0332,     // 1 once the held sweeps have stopped
+    REG_HOLD_LOCK = 0x0333,     // the buffer's handover, see readFrame()
+    REG_SCAN_RUN = 0x089B,      // 0 stops the held sweeps (at the end of a row)
+    FRAME_WAIT_MS = 500,        // for the end of a row: ~110ms at most (250 points at an RBW of 4.8kHz)
+    REG_RESULT = 0x0400,        // the data buffer, where the plugin keeps one level per point
+    REG_MANUAL_GAIN = 0x08B6,   // bit 5: manual gain, bits 3..0: the step (see setGain())
+    REG_AGC_HOLD = 0x08A7,      // bit 0: the AGC holds still (see startRx())
+    REG_AGC_PATCH = 0x08B5,     // bit 0: no frozen RSSI on strong signals (see the top)
+    MANUAL_GAIN_AFTER_RX_MS = 5,   // see startRx()
+    IMAGE_CAL_MIN_MHZ = 50, IMAGE_CAL_MAX_MHZ = 1014,   // see setSweep()
+    REG_VERSION = 0x0320,       // the ROM version string, 16 chars
+    // in GFSK RX, noise that passes for a packet is written to the data buffer too: a fixed packet length of
+    // one byte, at the very end of the buffer, keeps it away from the results
     RX_BASE = 0xFF,
   };
 
   SX1262* _radio;
-  uint8_t _params[11];
-  uint16_t _num_points;
-  uint8_t _agc_reg;   // 0x08B6 after the reset: the AGC
-  bool _active;
-  bool _stuck;        // 0x08BF bit 1 at the latest check
-  SPISettings _saved_spi;
+  uint8_t _gain = 0, _agc_reg = 0x0A;   // see setGain(); 0x08B6 as begin() found it
+  uint8_t _params[13];   // CMD_HOLD's parameters, see setSweep()
+  uint8_t _points;
+  bool _active, _holding;
+  uint32_t _asked_at;   // the latest frame asked for (readFrame())
 
-  // like a pulse on NRESET, wired or not: a cold sleep keeps nothing, and the chip boots again when woken (the
-  // plugin is gone and '2' is back at the end of the version string)
-  void resetChip() {
-    _radio->standby();
-    _radio->sleep(false);
-    _radio->standby(RADIOLIB_SX126X_STANDBY_RC, true);   // wakes it, then waits for the boot (BUSY)
-  }
-
-  static float pickRxBw(float khz) {
-    static const float bws[] = { 4.8, 5.8, 7.3, 9.7, 11.7, 14.6, 19.5, 23.4, 29.3, 39.0, 46.9, 58.6,
-                                 78.2, 93.8, 117.3, 156.2, 187.2, 234.3, 312.0, 373.6, 467.0 };
-    for (int i = 0; i < sizeof(bws)/sizeof(bws[0]); i++) {
-      if (bws[i] >= khz) return bws[i];
-    }
-    return 467.0;
+  // RSSI updates to skip after a retune: readings trail the frequency by ~3 updates up to 78kHz (seen in sweeps
+  // up and down over a steady carrier), ~4 at 150kHz and wider
+  static uint8_t latencyFor(float rbw_khz) {
+    return rbw_khz < 150 ? 3 : 4;
   }
 
 public:
-  enum { MAX_POINTS = 250 };   // + latency <= 255 updates per command
+  enum { MAX_POINTS = 250 };   // the plugin counts points + skipped updates in a byte
+  enum { GAIN_STEPS = 13 };    // setGain(): 1..13 = the AGC's steps from the lowest to the highest
+  // The datasheet (and RadioLib's setFrequency()) stop at 150..960MHz; the synthesizer locks from ~40 to ~1445MHz,
+  // and the receiver hears signals at the set frequency over that whole range (seen on the bench)
+  static constexpr float MIN_MHZ = 40.0f, MAX_MHZ = 1440.0f;
 
-  // radio: NULL where the board has another radio (the scanner then only says so, see hasRadio())
-  SX126xSpectrumScanner(SX1262* radio) : _radio(radio), _num_points(0), _agc_reg(0x0A), _active(false), _stuck(false) { }
+  // The GFSK RX bandwidths and their RSSI update periods (measured).
+  struct RxBw { float khz; float update_us; };
+  static const RxBw* rxBw(float khz) {
+    static const RxBw bws[] = {
+      { 4.8, 333 }, { 5.8, 276 }, { 7.3, 219 }, { 9.7, 165 }, { 11.7, 137 }, { 14.6, 110 }, { 19.5, 82 },
+      { 23.4, 68 }, { 29.3, 55 }, { 39.0, 41 }, { 46.9, 34 }, { 58.6, 27 }, { 78.2, 20 }, { 93.8, 17 },
+      { 117.3, 13.6 }, { 156.2, 10.2 }, { 187.2, 8.5 }, { 234.3, 6.8 }, { 312.0, 5.1 }, { 373.6, 4.3 },
+      { 467.0, 3.4 },
+    };
+    const int n = sizeof(bws) / sizeof(bws[0]);
+    for (int i = 0; i < n; i++) {
+      if (bws[i].khz >= khz - 0.05f) return &bws[i];
+    }
+    return &bws[n - 1];
+  }
+  // the narrowest RX bandwidth at least 'khz' wide (kHz; 467 at most)
+  static float pickRxBw(float khz) { return rxBw(khz)->khz; }
 
-  bool hasRadio() const { return _radio != NULL; }
-  bool isActive() const { return _active; }
+  // 0: the AGC; 1..GAIN_STEPS: a fixed gain step, lowest first. Takes effect with the next setSweep().
+  // The steps (as the AGC goes through them): 12 14 16 18 1A 1C 2A 2C 3C 4C 5C 6C 7C. The RSSI's own floor at an
+  // RBW of 19.5kHz is -83 / -88 / -92 / -94 / -100 / -104 / -106 dBm on the lowest seven, -110..-112 from 2C up;
+  // the AGC itself sits at 6C (12) when there's nothing strong.
+  void setGain(uint8_t gain) { _gain = gain > GAIN_STEPS ? GAIN_STEPS : gain; }
 
-  // resets the radio into GFSK and loads the plugin
-  int16_t begin(float freq_mhz, float tcxo, bool use_ldo) {
-    if (_radio == NULL) return RADIOLIB_ERR_UNSUPPORTED;
-    resetChip();   // a plugin of an earlier run may still be there, eg. after a restart of the MCU alone
-    int16_t err = _radio->beginFSK(freq_mhz, 4.8, 5.0, 234.3, 0, 16, tcxo, use_ldo);
+  explicit SX126xSpectrumScanner(SX1262* radio) : _radio(radio), _points(0), _active(false), _holding(false), _asked_at(0) { }
+
+  bool hasRadio() const { return _radio != NULL; }   // an SX1262
+  bool isActive() const { return _active; }          // between begin() and end()
+  uint8_t numPoints() const { return _points; }
+
+  // Puts the radio into GFSK RX and loads the plugin: RADIOLIB_ERR_UNSUPPORTED if the chip has another ROM.
+  // Expects a chip without the plugin, as from a reset or after end().
+  int16_t begin(float freq_mhz, float tcxo_voltage, bool use_ldo) {
+    int16_t err = _radio->beginFSK(freq_mhz, 4.8, 5.0, 234.3, 0, 16, tcxo_voltage, use_ldo);
     if (err == RADIOLIB_ERR_SPI_CMD_FAILED || err == RADIOLIB_ERR_SPI_CMD_INVALID) {
-      err = _radio->beginFSK(freq_mhz, 4.8, 5.0, 234.3, 0, 16, 0.0f, use_ldo);   // same TCXO fallback as std_init()
+      err = _radio->beginFSK(freq_mhz, 4.8, 5.0, 234.3, 0, 16, 0.0f, use_ldo);   // no TCXO, as CustomSX1262 retries
     }
     if (err != RADIOLIB_ERR_NONE) return err;
 
-    char ver[16];   // after the reset, so the plugin's tag isn't there yet
+    char ver[16];
     err = _radio->readRegister(REG_VERSION, (uint8_t*) ver, sizeof(ver));
     if (err != RADIOLIB_ERR_NONE) return err;
     if (memcmp(ver, "SX1261 V2D 2D02", 15) != 0) return RADIOLIB_ERR_UNSUPPORTED;
 
     err = _radio->uploadPatch(SX126X_SPECTRUM_PLUGIN, sizeof(SX126X_SPECTRUM_PLUGIN));
     if (err != RADIOLIB_ERR_NONE) return err;
-    if (_radio->mod->SPIreadRegister(REG_VERSION_TAG) != SX126X_SPECTRUM_PLUGIN_TAG) return RADIOLIB_ERR_CHIP_NOT_FOUND;
+    if (_radio->mod->SPIreadRegister(SX126X_SPECTRUM_PLUGIN_TAG_REG) != SX126X_SPECTRUM_PLUGIN_TAG) return RADIOLIB_ERR_CHIP_NOT_FOUND;
 
     err = _radio->fixedPacketLengthMode(1);
     if (err == RADIOLIB_ERR_NONE) err = _radio->setBufferBaseAddress(0, RX_BASE);
@@ -105,120 +116,157 @@ public:
   #ifdef SX126X_DIO2_AS_RF_SWITCH
     _radio->setDio2AsRfSwitch(SX126X_DIO2_AS_RF_SWITCH);
   #endif
-    _radio->setRxBoostedGainMode(true);
-    uint8_t r = 0;
+    uint8_t r = 0;   // see the top
     err = _radio->readRegister(REG_AGC_PATCH, &r, 1);
     r |= 0x01;
     if (err == RADIOLIB_ERR_NONE) err = _radio->writeRegister(REG_AGC_PATCH, &r, 1);
     if (err == RADIOLIB_ERR_NONE) err = _radio->readRegister(REG_MANUAL_GAIN, &_agc_reg, 1);
     if (err != RADIOLIB_ERR_NONE) return err;
-    _agc_reg &= ~0x20;
-    _stuck = false;
-
-    // RadioLib's default is 2MHz. The SX126x allows 16MHz (as does the nRF52840's SPIM3, the radio's bus on
-    // the Mesh Pocket), but reading the results takes ~0.3ms of a 4-56ms sweep at 8MHz already
-    ArduinoHal* hal = (ArduinoHal*) _radio->mod->hal;
-    _saved_spi = hal->spiSettings;
-    hal->spiSettings = SPISettings(8000000, MSBFIRST, SPI_MODE0);
     _active = true;
     return RADIOLIB_ERR_NONE;
   }
 
-  // Updates skipped after a retune: the point gets the next one, (latency + 1) updates after its retune.
-  // Readings trail the frequency by ~3 updates up to 78kHz (seen in sweeps up and down over a steady carrier),
-  // ~4 at 150kHz and wider.
-  static uint8_t latencyFor(float rbw_khz) {
-    return rbw_khz < 150 ? 3 : 4;
-  }
-
-  // Configure a sweep of num_points (<= MAX_POINTS) from start_mhz in step_mhz increments, with an RX
-  // bandwidth of at least rbw_khz.
-  int16_t setSweep(float start_mhz, float step_mhz, uint16_t num_points, float rbw_khz) {
-    if (num_points == 0 || num_points > MAX_POINTS) return RADIOLIB_ERR_INVALID_FREQUENCY;
-    float rbw = pickRxBw(rbw_khz);
-    _radio->standby();
-    int16_t err = _radio->setRxBandwidth(rbw);
+  // Sets up sweeps of 'points' (1..MAX_POINTS) points, from start_mhz in steps of step_mhz, measured through
+  // the narrowest RX bandwidth of at least rbw_khz. Stops held sweeps; startHold() starts them again.
+  int16_t setSweep(float start_mhz, float step_mhz, uint8_t points, float rbw_khz) {
+    if (points == 0 || points > MAX_POINTS) return RADIOLIB_ERR_INVALID_NUM_SAMPLES;
+    const RxBw* bw = rxBw(rbw_khz);
+    float rbw = bw->khz;
+    int16_t err = stopHold();
+    if (err == RADIOLIB_ERR_NONE) err = _radio->standby();
+    // as the gain steps were measured; the mesh's setting comes back with its own radio setup
+    if (err == RADIOLIB_ERR_NONE) err = _radio->setRxBoostedGainMode(true);
+    if (err == RADIOLIB_ERR_NONE) err = _radio->setRxBandwidth(rbw);
     if (err != RADIOLIB_ERR_NONE) return err;
-    float centre = start_mhz + step_mhz * num_points / 2;
-    err = _radio->calibrateImage(centre);   // see the top (~6.6 ms)
-    if (err == RADIOLIB_ERR_NONE) err = _radio->setFrequency(centre);
-    if (err == RADIOLIB_ERR_NONE) err = startRx();
+    // After a SetRfFrequency the image rejection is 15..30dB instead of ~43 (a strong signal shows again 2 x IF
+    // away, eg. 400kHz up at an RBW of 23.4kHz) until a CalibrateImage, which RadioLib's setFrequency() only does
+    // for a move of 20MHz or more. So it's done every time (~6.6ms).
+    // CalibrateImage takes its band in 4MHz units in a byte: nothing above ~1GHz, where the image stays as it is.
+    // Below ~50MHz the band RadioLib picks starts under ~40MHz, where the PLL doesn't lock: the command fails (and
+    // the next one reports it too), so none there either.
+    float centre = start_mhz + step_mhz * points / 2;
+    if (centre >= IMAGE_CAL_MIN_MHZ && centre <= IMAGE_CAL_MAX_MHZ) err = _radio->calibrateImage(centre);
+    if (err == RADIOLIB_ERR_NONE) err = _radio->setFrequencyRaw(centre);   // no 150..960MHz check, see MIN_MHZ
+    if (err != RADIOLIB_ERR_NONE) return err;
+    err = startRx();
     if (err != RADIOLIB_ERR_NONE) return err;
 
-    // poll the RSSI register ~8 times per update (a poll costs ~0.6us, a delay loop 0.125us: 2 cycles of the
-    // radio's 16MHz core). 3-5% of updates keep the value: when no change comes within ~1.25 periods, the reading
-    // is taken as it is
-    float update_us = 1600.0f / rbw;
+    // The plugin polls the RSSI register for each update: ~8 polls per update period, a poll taking ~0.6us
+    // plus 'delay' x 0.125us. 3-5% of updates keep the value (more on strong signals at a wide RBW): when no
+    // change comes within ~1.25 periods, the reading is taken as it is and the next update is due ~1 period on.
+    float update_us = bw->update_us;
     float delay = (update_us / 8 - 0.6f) / 0.125f;
     uint8_t d = delay < 0 ? 0 : (delay > 255 ? 255 : (uint8_t)delay);
-    float wait = 1.25f * update_us / (0.6f + 0.125f * d);
-    uint8_t w = wait < 4 ? 4 : (wait > 255 ? 255 : (uint8_t)wait);
+    float poll_us = 0.6f + 0.125f * d;
+    uint8_t w1 = waitPolls(1.25f * update_us / poll_us), w2 = waitPolls(1.1f * update_us / poll_us);
 
-    uint32_t f = (uint32_t)(start_mhz * 1048576.0);   // REG_FREQ units: MHz * 2^25 / 32
+    // frequencies in the radio's units: 32MHz / 2^25 per unit, ie. 2^20 per MHz
+    uint32_t f = (uint32_t)(start_mhz * 1048576.0);
     uint32_t s = (uint32_t)(step_mhz * 1048576.0 + 0.5);
-    uint8_t p[] = { (uint8_t)(f >> 24), (uint8_t)(f >> 16), (uint8_t)(f >> 8), (uint8_t)f,
-                    (uint8_t)(s >> 16), (uint8_t)(s >> 8), (uint8_t)s,
-                    (uint8_t)num_points, latencyFor(rbw), d, w };
+    uint8_t p[] = {
+      (uint8_t)(f >> 24), (uint8_t)(f >> 16), (uint8_t)(f >> 8), (uint8_t)f,   // first point
+      (uint8_t)(s >> 16), (uint8_t)(s >> 8), (uint8_t)s,                       // step
+      points, latencyFor(rbw), d, w1, w2,
+      0,                                                                       // rows up and down
+    };
     memcpy(_params, p, sizeof(_params));
-    _num_points = num_points;
+    _points = points;
     return RADIOLIB_ERR_NONE;
   }
 
-  uint16_t numPoints() const { return _num_points; }
-
-  // Runs one sweep (blocks for its duration). 'level' gets -2 * dBm per point, as GetRssiInst; it's only
-  // valid if this returns RADIOLIB_ERR_NONE.
-  int16_t sweep(uint8_t* level) {
-    if (!_active || _num_points == 0) return RADIOLIB_ERR_INVALID_FREQUENCY;
-    // a reset or brownout would leave the opcode pointing into whatever is in PRAM: check the plugin is there
-    if (_radio->mod->SPIreadRegister(REG_VERSION_TAG) != SX126X_SPECTRUM_PLUGIN_TAG) return RADIOLIB_ERR_CHIP_NOT_FOUND;
-    int16_t err = rssiStuck() ? startRx() : RADIOLIB_ERR_NONE;
-    if (err == RADIOLIB_ERR_NONE) err = _radio->mod->SPIwriteStream(CMD_SWEEP, _params, sizeof(_params));   // BUSY timeout
-    if (err == RADIOLIB_ERR_NONE) err = _radio->mod->SPIcheckStream();   // the plugin's status (bad params)
-    if (err == RADIOLIB_ERR_NONE) err = _radio->readRegister(REG_RESULT, level, _num_points);
+  // Starts held sweeps of the settings of setSweep(). Until stopHold(), the radio's core runs them: commands that
+  // need it are dropped meanwhile (registers can still be read and written).
+  int16_t startHold() {
+    if (!_active || _points == 0) return RADIOLIB_ERR_WRONG_MODEM;
+    // the plugin is gone if the chip was reset (eg. a brownout): its command would then run whatever is in RAM
+    if (_radio->mod->SPIreadRegister(SX126X_SPECTRUM_PLUGIN_TAG_REG) != SX126X_SPECTRUM_PLUGIN_TAG) return RADIOLIB_ERR_CHIP_NOT_FOUND;
+    uint8_t ff[MAX_POINTS], unlocked = 0;
+    memset(ff, 0xFF, _points);
+    int16_t err = _radio->writeRegister(REG_RESULT, ff, _points);
+    if (err == RADIOLIB_ERR_NONE) err = _radio->writeRegister(REG_HOLD_LOCK, &unlocked, 1);
+    if (err == RADIOLIB_ERR_NONE) err = _radio->mod->SPIwriteStream(CMD_HOLD, _params, sizeof(_params));   // returns at once
+    _holding = err == RADIOLIB_ERR_NONE;
     return err;
+  }
+
+  // A frame: the strongest level per point, -2 * dBm (as GetRssiInst), of the whole rows (once across the span)
+  // swept since the previous one. Doesn't wait: the first call asks the plugin for it, and a later one takes it
+  // (*got) once the plugin has finished the row under way.
+  // The radio's buffer has one read path for its core and the SPI: a read by the core while the host reads it
+  // hands the host the core's byte (and the other way round). So the plugin hands it over: the host asks (lock
+  // 1), the plugin sets 2 at the end of a row and waits, the host reads the buffer and sets 3, and the plugin
+  // clears it, sets 0 and goes on from point 0. The lock itself is in the radio's RAM, which has no such
+  // collision.
+  int16_t readFrame(uint8_t* level, bool* got) {
+    *got = false;
+    if (!_holding) return RADIOLIB_ERR_WRONG_MODEM;
+    uint8_t lock;
+    int16_t err = _radio->readRegister(REG_HOLD_LOCK, &lock, 1);
+    if (err != RADIOLIB_ERR_NONE) return err;
+    if (lock == 0) {
+      lock = 1;
+      _asked_at = millis();
+      return _radio->writeRegister(REG_HOLD_LOCK, &lock, 1);
+    }
+    if (lock != 2) return millis() - _asked_at > FRAME_WAIT_MS ? RADIOLIB_ERR_SPI_CMD_TIMEOUT : RADIOLIB_ERR_NONE;
+    err = _radio->readRegister(REG_RESULT, level, _points);
+    lock = 3;
+    if (err == RADIOLIB_ERR_NONE) err = _radio->writeRegister(REG_HOLD_LOCK, &lock, 1);
+    *got = err == RADIOLIB_ERR_NONE;
+    return err;
+  }
+
+  // Stops held sweeps, at the end of the row under way.
+  int16_t stopHold() {
+    if (!_holding) return RADIOLIB_ERR_NONE;
+    _holding = false;
+    uint8_t zero = 0, done = 0;
+    int16_t err = _radio->writeRegister(REG_SCAN_RUN, &zero, 1);
+    for (uint32_t t = millis(); err == RADIOLIB_ERR_NONE && millis() - t < 500; delay(1)) {
+      err = _radio->readRegister(REG_HOLD_DONE, &done, 1);
+      if (done == 1) return err;
+    }
+    return err == RADIOLIB_ERR_NONE ? RADIOLIB_ERR_SPI_CMD_TIMEOUT : err;
+  }
+
+  // Leaves the chip as a reset does, for the radio's own begin() to take it from there.
+  void end() {
+    stopHold();
+    // like a pulse on NRESET, wired or not: a cold sleep keeps nothing, and the chip boots again when woken
+    _radio->standby();
+    _radio->sleep(false);
+    _radio->standby(RADIOLIB_SX126X_STANDBY_RC, true);   // wakes it, then waits for the boot (BUSY)
+    // The reset also took the image calibration (back to 902-928MHz), and RadioLib's begin() redoes it only on a
+    // move of 20MHz from the frequency it last set (our last centre): this makes it redo it.
+    _radio->freqMHz = 0;
+    _active = false;
   }
 
 private:
-  // Starts the receiver with the AGC (started with a fixed step, its RSSI stays dead), then fixes the step and holds
-  // the AGC (with the step alone, it still holds the RSSI for ~3 points past a strong signal).
+  // Starts the receiver, with the AGC: started with a fixed step its RSSI stays dead. Nor does a step set too soon
+  // after SetRx take: from STDBY_XOSC (the TCXO kept on) the receiver needs ~0.5ms at an RBW of 19.5kHz, 1-2ms at
+  // 4.8-7.3kHz, and delay() may come a tick early.
   int16_t startRx() {
-    _stuck = false;
     int16_t err = _radio->standby(RADIOLIB_SX126X_STANDBY_XOSC);
-    // standby() put an external RF switch (RXEN/TXEN pins, eg. E22 modules) to idle, and the low-level setRx()
-    // doesn't set it back, unlike startReceive(): without this the sweep would run with the LNA path off
+    // standby() sets an external RF switch (RXEN/TXEN pins) to idle, and setRx() doesn't set it back (unlike
+    // startReceive())
     _radio->mod->setRfSwitchState(Module::MODE_RX);
-    uint8_t v = 0;
-    if (err == RADIOLIB_ERR_NONE) err = _radio->writeRegister(REG_AGC_HOLD, &v, 1);
+    uint8_t hold = 0;
+    if (err == RADIOLIB_ERR_NONE) err = _radio->writeRegister(REG_AGC_HOLD, &hold, 1);
     if (err == RADIOLIB_ERR_NONE) err = _radio->writeRegister(REG_MANUAL_GAIN, &_agc_reg, 1);
     if (err == RADIOLIB_ERR_NONE) err = _radio->setRx(RADIOLIB_SX126X_RX_TIMEOUT_INF);
-    if (err != RADIOLIB_ERR_NONE) return err;
-    delay(GAIN_AFTER_RX_MS);
-    v = 0x20 | GAIN_STEP;
-    err = _radio->writeRegister(REG_MANUAL_GAIN, &v, 1);
-    v = 0x01;
-    if (err == RADIOLIB_ERR_NONE) err = _radio->writeRegister(REG_AGC_HOLD, &v, 1);
+    if (err != RADIOLIB_ERR_NONE || _gain == 0) return err;
+    delay(MANUAL_GAIN_AFTER_RX_MS);
+    uint8_t g = 0x20 | _gain;   // the step codes are 1..13 (0 mutes the receiver)
+    err = _radio->writeRegister(REG_MANUAL_GAIN, &g, 1);
+    // With a fixed step alone, the AGC still acts on a strong signal: the RSSI holds for ~3 more points past it, then
+    // drops (a shelf at the peak's level). Holding the AGC as well leaves a smooth fall (the RSSI's own averaging).
+    hold = 1;
+    if (err == RADIOLIB_ERR_NONE) err = _radio->writeRegister(REG_AGC_HOLD, &hold, 1);
     return err;
   }
 
-  // 0x08BF bit 1 at this check and the one before (it also comes up for a few updates whenever the AGC would step)
-  bool rssiStuck() {
-    uint8_t r = 0;
-    bool now = _radio->readRegister(REG_AGC_STATE, &r, 1) == RADIOLIB_ERR_NONE && (r & 0x02);
-    bool stuck = now && _stuck;
-    _stuck = now && !stuck;
-    return stuck;
-  }
-
-public:
-  // also after a begin() that failed half-way
-  void end() {
-    if (_radio == NULL) return;
-    resetChip();   // for the LoRa setup that comes next: no plugin, fixed gain or held AGC left behind
-    // The reset also took the image calibration (back to the 902-928 MHz band), and RadioLib's begin() redoes it
-    // only on a move of 20 MHz from the frequency it last set (our last sweep's centre): this makes it redo it
-    _radio->freqMHz = 0;
-    if (_active) ((ArduinoHal*) _radio->mod->hal)->spiSettings = _saved_spi;
-    _active = false;
+  static uint8_t waitPolls(float polls) {
+    return polls < 4 ? 4 : (polls > 255 ? 255 : (uint8_t)polls);
   }
 };

@@ -48,6 +48,11 @@ class GxEPD2_213_B74_Fast : public GxEPD2_213_B74 {
     memset(&lut[144], EINK_FAST_FRAME_RATE, 6);
     _writeCommand(0x32);
     _writeData(lut, SSD1680Lut::LEN);
+    // and the voltages for it (SSD1680Lut.h): the panel's own refreshes load theirs from its OTP again
+    _writeCommand(0x3F); _writeData(SSD1680Lut::EOPT);
+    _writeCommand(0x03); _writeData(SSD1680Lut::VGH);
+    _writeCommand(0x04); _writeData(SSD1680Lut::VSH1); _writeData(SSD1680Lut::VSH2); _writeData(SSD1680Lut::VSL);
+    _writeCommand(0x2C); _writeData(SSD1680Lut::VCOM);
   }
 
   void loadFastLut() {

@@ -17,6 +17,13 @@
 namespace SSD1680Lut {
 
 enum { LEN = 153, B_B = 0, B_W = 1, W_B = 2, W_W = 3 };
+
+// The voltages that go with a LUT from the host (as Waveshare's EPD_2in13_V3 sends them with its waveforms): end
+// option 0x3F, gate 0x03 (VGH 20V), source 0x04 (VSH1 15V, VSH2 -, VSL -15V), VCOM 0x2C (-1.35V). Without them the
+// controller keeps those its own OTP waveform loaded at the last refresh of the panel's, with which VSL barely
+// drove anything: 96 frames towards white didn't undo 32 towards black (on a Mesh Pocket), so every waveform here
+// charged the panel towards black, however balanced in frames.
+enum { EOPT = 0x22, VGH = 0x17, VSH1 = 0x41, VSH2 = 0x00, VSL = 0x32, VCOM = 0x36 };
 enum { VS_NONE = 0x00, VS_WHITE = 0x80, VS_BLACK_THEN_WHITE = 0x60, VS_WHITE_THEN_BLACK = 0x90 };   // phases A, B
 
 inline uint8_t& vs(uint8_t* lut, int transition, int group) { return lut[12 * transition + group]; }

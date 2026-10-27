@@ -128,7 +128,7 @@ public:
   // from AbstractUITask
   void notify(UIEventType t = UIEventType::none) override;
   void loop() override;
-  bool isRadioBorrowed() const override;
+  bool isRadioBorrowed() const;   // the spectrum view has the radio
 
   void shutdown(bool restart = false);
 };

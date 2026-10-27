@@ -3,7 +3,7 @@
 // The spectrum view of a companion UI: a live graph with peak hold and a waterfall of a band around the node's
 // channel, from sweeps the SX1262 runs itself (SX126xSpectrumScanner). The UI around it (ui-new's page, or a
 // variant's own UI) gives it a display to draw on and a Host for alerts and to leave; the mesh is paused while it
-// owns the radio (ownsRadio(): the UI reports it as isRadioBorrowed()).
+// owns the radio (ownsRadio(), RadioLibWrapper::borrow()).
 // Needs the variant's target.h (board, radio_driver) included first, and FreeRTOS (nRF52, ESP32).
 
 #include <Arduino.h>
@@ -18,6 +18,9 @@ extern RADIO_CLASS radio;   // in every variant's target.cpp
 template <class R> static SX1262* spectrumRadio(R& r, std::true_type) { return &r; }
 template <class R> static SX1262* spectrumRadio(R&, std::false_type) { return NULL; }
 
+#ifndef SPECTRUM_GAIN
+  #define SPECTRUM_GAIN        13      // a fixed gain step, the AGC's top one (7C): no AGC shelf after strong signals
+#endif
 #define SPECTRUM_POINTS      SX126xSpectrumScanner::MAX_POINTS   // at most; a sweep has as many points as the panel is wide
 #ifndef SPECTRUM_FRAME_MS
   #define SPECTRUM_FRAME_MS      50    // min time between drawing frames (the panel refresh overlaps it)
@@ -43,8 +46,9 @@ template <class R> static SX1262* spectrumRadio(R&, std::false_type) { return NU
 // SDR-like view of the band around the mesh frequency: live spectrum with decaying peak-hold, plus a waterfall.
 // Sweeps run continuously in their own RTOS task, so they don't stop while the display is drawn or refreshed;
 // each display frame shows the maximum seen at each point since the previous frame, so short bursts aren't lost.
-// The mesh is paused while this screen owns the radio (the app is still served).
-class SpectrumView {
+// The view borrows the radio from the mesh meanwhile (RadioLibWrapper::borrow()): the mesh neither receives nor sends,
+// and the app is still served.
+class SpectrumView : public RadioBorrower {
 public:
   // what the view needs from the UI around it
   struct Host {
@@ -118,25 +122,43 @@ private:
 
   static void scanTaskEntry(void* self) { ((SpectrumView *) self)->scanLoop(); }
 
-  void applySpan(uint8_t idx) {
+  // the radio sweeps on by itself with these settings (held sweeps), until the next setSweep() or end()
+  int16_t applySpan(uint8_t idx) {
     int n = _points;
     float step = spanMHz(idx) / n;
-    _scanner.setSweep(edgeMHz(idx) + step / 2, step, n, step * 1000.0f * spanRbwSteps(idx));
+    int16_t err = _scanner.setSweep(edgeMHz(idx) + step / 2, step, n, step * 1000.0f * spanRbwSteps(idx));
+    if (err == RADIOLIB_ERR_NONE) err = _scanner.startHold();
     for (int i = 0; i < SPECTRUM_POINTS; i++) _cur[i] = _fmax[i] = SPECTRUM_NO_SIGNAL;
+    return err;
   }
 
   void scanLoop() {
     uint8_t level[SPECTRUM_POINTS];
+    bool held = false;   // the radio sweeps with the latest settings
     while (_run) {
       uint8_t gen = _cfg_gen;
-      if (gen != _cfg_applied) {
-        applySpan(_span_req);
+      if (gen != _cfg_applied || !held) {
+        int16_t err = applySpan(_span_req);
         _cfg_applied = gen;
+        held = err == RADIOLIB_ERR_NONE;
+        _sweep_err = err;
+        if (!held) {                      // shown in the header; keep trying
+          delay(10);
+          continue;
+        }
       }
-      int16_t err = _scanner.sweep(level);   // the whole sweep runs in the radio
+      // the strongest level per point over the whole rows since the previous frame: asked for on the first call,
+      // taken once the radio ends the row under way
+      bool got = false;
+      int16_t err = _scanner.readFrame(level, &got);
       _sweep_err = err;
-      if (err != RADIOLIB_ERR_NONE) {     // shown in the header; keep trying
+      if (err != RADIOLIB_ERR_NONE) {     // eg. no row ended in time: start the sweeps again
+        held = false;
         delay(10);
+        continue;
+      }
+      if (!got) {
+        delay(1);
         continue;
       }
       if (_cfg_gen != gen) continue;      // span or channel changed meanwhile
@@ -416,10 +438,10 @@ private:
   void restoreRadio() {
     _scanner.end();   // resets the SX126x, which drops the plugin
     bool ok = radio_init();
+    radio_driver.giveBack();   // before the settings: the wrapper keeps them from the chip while it's borrowed
     radio_driver.setParams(_prefs->freq, _prefs->bw, _prefs->sf, _prefs->cr);
     radio_driver.setTxPower(_prefs->tx_power_dbm);
     radio_driver.setRxBoostedGainMode(_prefs->rx_boosted_gain);
-    radio_driver.onExternalReinit();
     if (!ok) _host->spectrumAlert("Radio restore failed!", 3000);
   }
 
@@ -443,6 +465,7 @@ public:
   }
 
   bool ownsRadio() const { return _scanner.isActive(); }
+  void returnRadio() override { stop(); }   // wanted back at once (RadioLibWrapper::powerOff())
   bool isOpen() const { return _wf != NULL; }   // between start() and stop()
 
   void start(DisplayDriver& d) {
@@ -484,7 +507,7 @@ public:
       _host->spectrumExit();
       return;
     }
-    if (!_pending_start || !radio_driver.isIdleInRecvMode()) return;   // not mid-TX, mid-RX or with a packet to read
+    if (!_pending_start || !radio_driver.borrow(this)) return;   // not mid-TX, mid-RX, with a packet to read, or lent
     _pending_start = false;
   #ifdef SX126X_DIO3_TCXO_VOLTAGE
     float tcxo = SX126X_DIO3_TCXO_VOLTAGE;
@@ -497,6 +520,7 @@ public:
     bool ldo = false;
   #endif
     int16_t err = _scanner.begin(_freq, tcxo, ldo);
+    _scanner.setGain(SPECTRUM_GAIN);
     if (err != RADIOLIB_ERR_NONE || !startScanTask()) {
       char tmp[32];
       sprintf(tmp, "Scan failed: %d", err);
