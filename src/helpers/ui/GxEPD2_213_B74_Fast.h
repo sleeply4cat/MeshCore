@@ -1,6 +1,7 @@
 #pragma once
 
 #include <GxEPD2_BW.h>
+#include "SSD1680Lut.h"
 
 #ifndef EINK_FAST_KICK_FRAMES
   #define EINK_FAST_KICK_FRAMES 0     // optional: push a changing pixel the other way first (cleaner, less contrast)
@@ -26,7 +27,10 @@
 //    every frame did harm both ways: a one-way push left DC charge (a light band that faded over minutes),
 //    and a balanced shake slowly washed out black text and greyed the white background from the edges.
 //    DC still balances per pixel over each white->black->white cycle.
-//  - a fast clear (all black, then all white), for a clean start without the full refresh's 3.6s.
+//  - a fast clear (all black, then all white), for a clean start without the full refresh's 3.6s. It closes the
+//    black-white cycles of the pixels that are black (SSD1680Lut.h): those of the fast waveform with extra frames
+//    towards white, those of the panel's own (OTP) waveform with a refresh to white in that waveform first; else
+//    each entry and exit of a live view left charge towards black in them, which greyed the panel for good.
 //  - the panel stays powered between frames (update control 0x04, not 0xC4/0xCC, which re-run the analog
 //    power-up every time and cost ~90ms).
 //  - full-frame writes in a single SPI transfer: GxEPD2 sends the frame byte by byte, which on nRF52
@@ -38,36 +42,23 @@ class GxEPD2_213_B74_Fast : public GxEPD2_213_B74 {
   bool _fast = false, _refreshing = false, _prev_valid = false;
   uint8_t _prev[FRAME_BYTES];   // what the panel shows (or is busy showing)
 
-  // 153-byte SSD1680 LUT: VS bytes for LUT0 = B->B, LUT1 = B->W, LUT2 = W->B, LUT3 = W->W, LUT4 = VCOM, 12 groups
-  // each (2 bits per phase A..D: 01 = VSH1 -> black, 10 = VSL -> white); then 7 timing bytes per group
-  // (TP A, TP B, SR AB, TP C, TP D, SR CD, RP); frame rates; gate scan.
-  enum { VS_BLACK_THEN_WHITE = 0x60, VS_WHITE_THEN_BLACK = 0x90 };   // phase A, phase B
-  static uint8_t& vs(uint8_t* lut, int transition, int group) { return lut[12 * transition + group]; }
-  static uint8_t* timing(uint8_t* lut, int group) { return &lut[60 + 7 * group]; }
+  bool _screen_fast = false;    // the black pixels on the panel are the fast waveform's (else the OTP's)
 
   void loadLut(uint8_t* lut) {
     memset(&lut[144], EINK_FAST_FRAME_RATE, 6);
     _writeCommand(0x32);
-    _writeData(lut, 153);
+    _writeData(lut, SSD1680Lut::LEN);
   }
 
   void loadFastLut() {
-    uint8_t lut[153];
-    memset(lut, 0, sizeof(lut));       // LUT0 (B->B) and LUT3 (W->W): VSS, no drive
-    vs(lut, 1, 0) = VS_BLACK_THEN_WHITE;   // B->W: kick, then white
-    vs(lut, 2, 0) = VS_WHITE_THEN_BLACK;   // W->B: kick, then black
-    timing(lut, 0)[0] = EINK_FAST_KICK_FRAMES;   // TP A
-    timing(lut, 0)[1] = EINK_FAST_FRAMES;        // TP B
+    uint8_t lut[SSD1680Lut::LEN];
+    SSD1680Lut::fastLut(lut, EINK_FAST_KICK_FRAMES, EINK_FAST_FRAMES);
     loadLut(lut);
   }
 
-  void loadClearLut() {
-    uint8_t lut[153];
-    memset(lut, 0, sizeof(lut));
-    for (int t = 0; t < 4; t++) vs(lut, t, 0) = VS_BLACK_THEN_WHITE;   // whatever the RAM says
-    timing(lut, 0)[0] = EINK_CLEAR_FRAMES;   // TP A
-    timing(lut, 0)[1] = EINK_CLEAR_FRAMES;   // TP B
-    timing(lut, 0)[6] = EINK_CLEAR_CYCLES - 1;   // RP: repeats
+  void loadClearLut(int extra_white) {
+    uint8_t lut[SSD1680Lut::LEN];
+    SSD1680Lut::clearLut(lut, EINK_CLEAR_FRAMES, EINK_CLEAR_CYCLES, extra_white);
     loadLut(lut);
   }
 
@@ -172,20 +163,30 @@ public:
     loadFastLut();       // the OTP partial refresh (0xFC) reloads its own LUT, so set ours every time
     update();
     _refreshing = true;  // waited for before the next write
+    _screen_fast = true;
   }
 
-  // Wipes the panel to white (~0.6s, blocking). Returns false if not possible yet.
+  // Wipes the panel to white (~0.6s, blocking; ~1.5s when the panel shows the slow path's picture), closing the
+  // black-white cycles of the pixels that were black (see the top). Returns false if not possible yet.
   bool clearFast() {
     waitIdle();
     if (!_init_display_done || _initial_refresh) return false;
+    // the RAMs for a clear: 0x26 = what the panel shows, 0x24 = white
+    if (_prev_valid) writeFrame(0x26, _prev);   // fast path; on the slow path 0x26 already holds it
+    memset(_prev, 0xFF, FRAME_BYTES);
+    writeFrame(0x24, _prev);
+    if (!_screen_fast) {
+      // the black pixels are the OTP waveform's: to white with it, the only one that knows how to undo them
+      GxEPD2_213_B74::refresh(0, 0, WIDTH, HEIGHT);
+      writeFrame(0x26, _prev);
+    }
     powerOn();
-    loadClearLut();
+    loadClearLut(EINK_FAST_FRAMES - EINK_FAST_KICK_FRAMES);   // the fast W->B charge, undone on the B->W pixels
     update();
     _waitWhileBusy("_Clear_Fast", 1500);
-    memset(_prev, 0xFF, FRAME_BYTES);   // the panel is now white: so are both RAMs
-    writeFrame(0x26, _prev);
-    writeFrame(0x24, _prev);
+    writeFrame(0x26, _prev);   // the panel is now white: so are both RAMs
     _prev_valid = true;
+    _screen_fast = false;
     return true;
   }
 
