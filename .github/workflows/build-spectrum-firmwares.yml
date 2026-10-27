@@ -1,7 +1,7 @@
 name: Build Spectrum Firmwares
 
 # Releases of this fork's spectrum branches: a tag v<upstream version>-spectrum-<variant>.<n> (eg.
-# v1.17.1-spectrum-ui.1) on a commit of a branch builds the envs that branch lists in
+# v1.18.0-spectrum-ui.1) on a commit of a branch builds the envs that branch lists in
 # .github/spectrum-envs, and drafts a release with them. A manual run only keeps the files as artifacts.
 #
 # Only people who can push tags or run workflows here (write access) start it: no pull_request triggers.

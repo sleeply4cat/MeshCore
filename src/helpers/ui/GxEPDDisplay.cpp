@@ -228,7 +228,9 @@ void GxEPDDisplay::endFrame() {
   uint32_t crc = display_crc.finalize();
   if (crc != last_display_crc_value || _native_drawn) {
     display.display(true);
-    if (_cycles_before_full_refresh > 0) {
+    // live views (native drawing) leave the screen with a wipe of their own: their frames would
+    // bring a full refresh every few seconds otherwise
+    if (_cycles_before_full_refresh > 0 && !_native_drawn) {
       _cycles_before_full_refresh--;
     }
   }

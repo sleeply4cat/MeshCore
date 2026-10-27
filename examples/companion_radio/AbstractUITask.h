@@ -40,5 +40,4 @@ public:
 
   virtual void notify(UIEventType t = UIEventType::none) = 0;
   virtual void loop() = 0;
-  virtual bool isRadioBorrowed() const { return false; }   // true while UI has taken over the radio (eg. spectrum scan)
 };
