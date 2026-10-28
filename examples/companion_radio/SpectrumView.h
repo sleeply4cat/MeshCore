@@ -23,7 +23,7 @@ template <class R> static SX1262* spectrumRadio(R&, std::false_type) { return NU
   #define SPECTRUM_GAIN        13      // a fixed gain step, the AGC's top one (7C): no AGC shelf after strong signals
 #endif
 #if SPECTRUM_BLE && !defined(SPECTRUM_BLE_FRAME_MS)
-  #define SPECTRUM_BLE_FRAME_MS  50   // default interval of the frames for a stream client (it can change it)
+  #define SPECTRUM_BLE_FRAME_MS  20   // default interval of the frames for a stream client (it can change it)
 #endif
 #define SPECTRUM_POINTS      SX126xSpectrumScanner::MAX_POINTS   // at most; a sweep has as many points as the panel is wide
 #ifndef SPECTRUM_FRAME_MS
