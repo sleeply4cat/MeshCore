@@ -9,22 +9,16 @@
 // 153-byte SSD1680 LUT: VS bytes for LUT0 = B->B, LUT1 = B->W, LUT2 = W->B, LUT3 = W->W (old -> new colour, from
 // the RAMs 0x26 -> 0x24), LUT4 = VCOM, 12 groups each (2 bits per phase A..D, A in the top bits: 00 = VSS, no drive,
 // 01 = VSH1 -> black, 10 = VSL -> white); then 7 timing bytes per group (TP A, TP B, SR AB, TP C, TP D, SR CD, RP:
-// frames per phase, repeats of A-B and of C-D, repeats of the group); frame rates; gate and source voltages.
+// frames per phase, repeats of A-B and of C-D, repeats of the group); frame rates; gate scan.
 //
 // DC balance: a pixel's drive towards black has to be undone by as much towards white over its black-white cycle,
 // or the charge left in the panel greys it (and makes it hard to clear). Each waveform here is balanced within the
-// cycles it draws itself; the clear has to close the cycles another waveform opened (see clearLut()).
+// cycles it draws itself (GxEPD2_213_B74_Fast::wipeWhite()).
 namespace SSD1680Lut {
 
 enum { LEN = 153, B_B = 0, B_W = 1, W_B = 2, W_W = 3 };
 
-// The voltages that go with a LUT from the host (as Waveshare's EPD_2in13_V3 sends them with its waveforms): end
-// option 0x3F, gate 0x03 (VGH 20V), source 0x04 (VSH1 15V, VSH2 -, VSL -15V), VCOM 0x2C (-1.35V). Without them the
-// controller keeps those its own OTP waveform loaded at the last refresh of the panel's, with which VSL barely
-// drove anything: 96 frames towards white didn't undo 32 towards black (on a Mesh Pocket), so every waveform here
-// charged the panel towards black, however balanced in frames.
-enum { EOPT = 0x22, VGH = 0x17, VSH1 = 0x41, VSH2 = 0x00, VSL = 0x32, VCOM = 0x36 };
-enum { VS_NONE = 0x00, VS_WHITE = 0x80, VS_BLACK_THEN_WHITE = 0x60, VS_WHITE_THEN_BLACK = 0x90 };   // phases A, B
+enum { VS_BLACK_THEN_WHITE = 0x60, VS_WHITE_THEN_BLACK = 0x90 };   // phases A, B
 
 inline uint8_t& vs(uint8_t* lut, int transition, int group) { return lut[12 * transition + group]; }
 inline uint8_t* timing(uint8_t* lut, int group) { return &lut[60 + 7 * group]; }
@@ -37,21 +31,6 @@ inline void fastLut(uint8_t* lut, int kick_frames, int frames) {
   vs(lut, W_B, 0) = VS_WHITE_THEN_BLACK;
   timing(lut, 0)[0] = kick_frames;   // TP A
   timing(lut, 0)[1] = frames;        // TP B
-}
-
-// to white: every pixel black then white, cycles times (balanced), whatever is on the panel; then the pixels that
-// were black (B->W) get extra_white frames more towards white, to close the cycle that the waveform which made them
-// black left open (fast: its W->B charge, frames - kick_frames)
-inline void clearLut(uint8_t* lut, int frames, int cycles, int extra_white) {
-  memset(lut, 0, LEN);
-  for (int t = 0; t < 4; t++) vs(lut, t, 0) = VS_BLACK_THEN_WHITE;
-  timing(lut, 0)[0] = frames;       // TP A
-  timing(lut, 0)[1] = frames;       // TP B
-  timing(lut, 0)[6] = cycles - 1;   // RP: repeats
-  if (extra_white > 0) {
-    vs(lut, B_W, 1) = VS_WHITE;
-    timing(lut, 1)[0] = extra_white;
-  }
 }
 
 // the DC a waveform leaves on a pixel of a transition: frames towards black minus frames towards white

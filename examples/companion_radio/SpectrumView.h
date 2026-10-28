@@ -494,8 +494,9 @@ public:
     }
     if (_scanner.isActive()) restoreRadio();
     if (_display) {
-      _display->wipe();   // leave no ghosts behind for the next screen
+      _display->wipe();   // the live view's picture to white, with its own waveform
       _display->setFastRefresh(false);
+      _display->wipe();   // and then a clean panel for the next screen (on e-ink, its own full refresh)
     }
     freeBuffers();
   }

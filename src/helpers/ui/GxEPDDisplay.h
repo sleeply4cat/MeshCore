@@ -84,7 +84,7 @@ public:
   void fillRectNative(int x, int y, int w, int h) override;
 #ifdef EINK_FAST_PARTIAL
   bool setFastRefresh(bool fast) override { display.epd2.setFastPartial(fast); return true; }
-  bool wipe() override { return display.epd2.clearFast(); }
+  bool wipe() override { return display.epd2.wipeWhite(); }
 #endif
   void endFrame() override;
 };
