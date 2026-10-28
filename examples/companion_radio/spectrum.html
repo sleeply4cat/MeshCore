@@ -496,13 +496,14 @@ function finishFrame() {
     const h = mode === 'decay' ? hold[i] - 0.25 : hold[i];
     hold[i] = dbm[i] > h || isNaN(h) ? dbm[i] : h;
   }
-  // noise: median of the frame; the plot's floor follows it in 5 dB steps
+  // noise: median of the frame; the plot's floor follows it in 5 dB steps, ~10 dB below, and moves only once the
+  // noise is 5 dB off that (else a noise near a step's edge flipped the whole plot up and down)
   const sorted = Array.from(dbm).filter((v) => !isNaN(v)).sort((a, b) => a - b);
   if (sorted.length) {
     const med = sorted[sorted.length >> 1];
     noiseDb = noiseDb === null ? med : noiseDb + (med - noiseDb) * 0.1;
-    const want = Math.floor((noiseDb - 10) / 5) * 5;
-    if (Math.abs(want - floorDb) >= 5) floorDb = want;
+    const d = noiseDb - floorDb;
+    if (d < 5 || d > 15) floorDb = Math.round((noiseDb - 10) / 5) * 5;
   }
   const now = performance.now();
   frameTimes.push(now);
