@@ -218,7 +218,7 @@ function parseInfo(dv) {
     startHz: dv.getUint32(4, true), stepHz: dv.getUint32(8, true), rbwHz: dv.getUint32(12, true),
     centreHz: dv.getUint32(16, true), nodeHz: dv.getUint32(20, true), nodeBwHz: dv.getUint32(24, true),
     err: dv.getInt16(28, true), gen: dv.getUint8(30), follow: (dv.getUint8(31) & 1) !== 0,
-    onDevice: (dv.getUint8(31) & 2) !== 0,   // opened on the node itself: only it can close it
+    onDevice: (dv.getUint8(31) & 2) !== 0,   // opened on the node itself: Stop closes it there too
     intervalMs: dv.byteLength >= 36 ? dv.getUint16(32, true) : null, agg: dv.byteLength >= 36 ? dv.getUint8(34) : null,
   };
 }
@@ -382,8 +382,8 @@ function onInfo(inf) {
   if (ctrlChr) ui.interval.disabled = inf.intervalMs === null;
   if (!prev || prev.gen !== inf.gen || prev.n !== inf.n || prev.startHz !== inf.startHz || prev.stepHz !== inf.stepHz) resetTraces();
   ui.run.textContent = inf.state === STATE.OFF ? 'Start' : 'Stop';
-  ui.run.disabled = !ctrlChr || inf.onDevice;
-  ui.run.title = inf.onDevice ? 'Opened on the node: close it there' : '';
+  ui.run.disabled = !ctrlChr;
+  ui.run.title = inf.onDevice ? 'Opened on the node: Stop closes it there too' : '';
   ui.run.classList.toggle('primary', inf.state === STATE.OFF);
   ui.spans.forEach((b, i) => b.classList.toggle('on', i === inf.span));
   if (document.activeElement !== ui.centre) ui.centre.value = (inf.centreHz / 1e6).toFixed(3);

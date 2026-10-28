@@ -776,7 +776,7 @@ public:
     else _task->gotoHomeScreen();   // stops the view, see UITask::setCurrScreen()
   }
   void spectrumOpen() override { _task->startSpectrumForClient(); }   // a BLE client asks for the view
-  bool spectrumClientMayStop() override { return _for_client; }        // not the one on the display
+  bool spectrumOnDevice() override { return !_for_client; }
 #if SPECTRUM_BLE
   // the BLE client's requests and the state it sees, whatever the screen; a view it opened lasts while it listens
   void streamLoop() {

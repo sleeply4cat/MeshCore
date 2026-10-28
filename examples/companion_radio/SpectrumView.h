@@ -59,7 +59,7 @@ public:
     virtual void spectrumAlert(const char* text, int duration_ms) = 0;
     virtual void spectrumExit() = 0;   // leave the view: the host calls stop() on the way
     virtual void spectrumOpen() { }    // a stream client asks for the view: the host opens it (start())
-    virtual bool spectrumClientMayStop() { return true; }   // false: the client can't close it (opened on the device)
+    virtual bool spectrumOnDevice() { return false; }   // opened on the device's display (not by the stream client)
   };
 
   // A client of the sweeps beside the display, eg. a BLE service for a web page (SPECTRUM_BLE): frames go to it
@@ -73,7 +73,7 @@ public:
   //        keep the strongest level per point, there's no mean or single sweep to send)
   struct Stream {
     enum { STATE_OFF = 0, STATE_STARTING = 1, STATE_RUNNING = 2 };
-    enum { FLAG_FOLLOW = 1, FLAG_ON_DEVICE = 2 };   // centre on the node's channel; opened on the device: no CTRL_STOP
+    enum { FLAG_FOLLOW = 1, FLAG_ON_DEVICE = 2 };   // centre on the node's channel; opened on the device (CTRL_STOP closes it there)
     enum { CTRL_START = 1, CTRL_STOP = 2, CTRL_SPAN = 3, CTRL_CENTRE = 4, CTRL_INTERVAL = 5, CTRL_AGG = 6 };
     enum { AGG_MAX = 0 };
     enum { INFO_LEN = 36 };
@@ -697,7 +697,7 @@ public:
           if (!isOpen()) _host->spectrumOpen();
           break;
         case Stream::CTRL_STOP:
-          if (isOpen() && _host->spectrumClientMayStop()) {
+          if (isOpen()) {
             _host->spectrumAlert("Mesh radio resumed", 1000);
             _host->spectrumExit();
           }
@@ -765,7 +765,7 @@ private:
     info[28] = err;
     info[29] = err >> 8;
     info[30] = _cfg_gen;
-    info[31] = (_follow ? Stream::FLAG_FOLLOW : 0) | (isOpen() && !_host->spectrumClientMayStop() ? Stream::FLAG_ON_DEVICE : 0);
+    info[31] = (_follow ? Stream::FLAG_FOLLOW : 0) | (isOpen() && _host->spectrumOnDevice() ? Stream::FLAG_ON_DEVICE : 0);
     info[32] = _str_ms;
     info[33] = _str_ms >> 8;
     info[34] = Stream::AGG_MAX;
